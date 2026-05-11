@@ -1,0 +1,14 @@
+build/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.s
+*.out
+.DS_Store
+.vscode/
