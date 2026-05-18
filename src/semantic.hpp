@@ -9,11 +9,6 @@
 #include <vector>
 
 namespace Semantic {
-
-// Учебная промежуточная версия семантического анализатора.
-// Здесь оставлены базовые проверки, а часть более сложных конструкций
-// помечена как TODO и пока считается неподдержанной.
-
 struct SemanticError {
     std::string filename {};
     std::string message {};
