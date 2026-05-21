@@ -2,13 +2,14 @@
 
 #include "ast.hpp"
 
-#include <cstddef>
 #include <expected>
+#include <cstddef>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace Semantic {
+
 struct SemanticError {
     std::string filename {};
     std::string message {};
@@ -66,4 +67,4 @@ struct SemanticResult {
 std::expected<SemanticResult, SemanticError> analyze_program(
     const AST::Program& program, std::string filename = "<memory>");
 
-} 
+}

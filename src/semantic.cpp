@@ -1,9 +1,10 @@
 #include "semantic.hpp"
-
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -15,12 +16,14 @@ namespace {
 
 std::string join_path(const std::vector<std::string>& parts) {
     std::string result;
+
     for (std::size_t i = 0; i < parts.size(); ++i) {
         if (i > 0) {
             result += "::";
         }
         result += parts[i];
     }
+
     return result;
 }
 
@@ -38,9 +41,16 @@ bool is_builtin_type_name(std::string_view name) {
            name == "void";
 }
 
+bool is_int_literal_expr(const AST::Expr& expr) {
+    return dynamic_cast<const AST::IntLiteralExpr*>(&expr) != nullptr;
+}
+
+bool is_float_literal_expr(const AST::Expr& expr) {
+    return dynamic_cast<const AST::FloatLiteralExpr*>(&expr) != nullptr;
+}
+
 bool is_numeric_literal_expr(const AST::Expr& expr) {
-    return dynamic_cast<const AST::IntLiteralExpr*>(&expr) != nullptr ||
-           dynamic_cast<const AST::FloatLiteralExpr*>(&expr) != nullptr;
+    return is_int_literal_expr(expr) || is_float_literal_expr(expr);
 }
 
 }  // namespace
@@ -58,6 +68,7 @@ class Analyzer {
   private:
     enum class TypeKind {
         Builtin,
+        Array,
         Struct,
     };
 
@@ -69,6 +80,8 @@ class Analyzer {
     struct Type {
         TypeKind kind = TypeKind::Builtin;
         std::string name {};
+        TypePtr element_type {};
+        std::size_t array_size = 0;
         StructSymbol* struct_symbol = nullptr;
 
         [[nodiscard]] bool is_void() const { return kind == TypeKind::Builtin && name == "void"; }
@@ -187,13 +200,21 @@ class Analyzer {
         auto main_it = functions_.find("main");
         if (main_it == functions_.end() || main_it->second->is_builtin) {
             return std::unexpected(make_error(Lexer::SourceLocation {},
-                                              "function 'main' with signature 'func main() -> int32' is required"));
+                                              "function 'main' with signature 'func main() -> "
+                                              "int32' is required"));
         }
 
-        if (!main_it->second->parameter_types.empty() ||
-            !same_type(main_it->second->return_type, builtin_type("int32"))) {
-            return std::unexpected(make_error(main_it->second->decl->range.begin,
-                                              "function 'main' must have signature 'func main() -> int32'"));
+        auto& main_function = *main_it->second;
+        auto main_signature = resolve_function_signature(main_function);
+        if (!main_signature) {
+            return std::unexpected(main_signature.error());
+        }
+
+        if (!main_function.parameter_types.empty() ||
+            !same_type(main_function.return_type, builtin_type("int32"))) {
+            return std::unexpected(make_error(main_function.decl->range.begin,
+                                              "function 'main' must have signature "
+                                              "'func main() -> int32'"));
         }
 
         current_namespace_.clear();
@@ -211,9 +232,12 @@ class Analyzer {
     std::vector<std::string> current_namespace_;
     std::vector<std::unordered_map<std::string, VariableSymbol>> local_scopes_;
     TypePtr current_return_type_ {};
+    std::string current_function_name_ {};
     int loop_depth_ = 0;
 
     std::unordered_map<std::string, TypePtr> builtin_types_;
+    std::unordered_map<std::string, TypePtr> array_types_;
+    std::unordered_set<std::string> namespaces_;
     std::unordered_set<std::string> occupied_names_;
     std::unordered_map<std::string, std::unique_ptr<StructSymbol>> structs_;
     std::unordered_map<std::string, std::unique_ptr<AliasSymbol>> aliases_;
@@ -260,7 +284,71 @@ class Analyzer {
         functions_.emplace(symbol->full_name, std::move(symbol));
     }
 
-    TypePtr builtin_type(const std::string& name) const { return builtin_types_.at(name); }
+    TypePtr builtin_type(const std::string& name) const {
+        const auto it = builtin_types_.find(name);
+        if (it == builtin_types_.end()) {
+            throw std::runtime_error("missing builtin type: " + name);
+        }
+        return it->second;
+    }
+
+    SemanticType to_public_type(const TypePtr& type) const {
+        SemanticType result;
+
+        if (type == nullptr) {
+            return result;
+        }
+
+        switch (type->kind) {
+            case TypeKind::Builtin:
+                result.kind = SemanticTypeKind::Builtin;
+                result.name = type->name;
+                break;
+
+            case TypeKind::Array:
+                result.kind = SemanticTypeKind::Array;
+                result.name = type->name;
+                result.array_size = type->array_size;
+                if (type->element_type != nullptr) {
+                    result.element_type_name = type->element_type->name;
+                }
+                break;
+
+            case TypeKind::Struct:
+                result.kind = SemanticTypeKind::Struct;
+                result.name = type->name;
+                break;
+        }
+
+        return result;
+    }
+
+    void annotate_expr(const AST::Expr& expression, const TypePtr& type) {
+        if (type != nullptr) {
+            result_.expr_types[&expression] = to_public_type(type);
+        }
+    }
+
+    ExprInfo make_value_info(const AST::Expr& expression, const TypePtr& type, bool is_lvalue = false,
+                             bool is_mutable_lvalue = false) {
+        annotate_expr(expression, type);
+        return ExprInfo {
+            .type = type,
+            .function = nullptr,
+            .is_lvalue = is_lvalue,
+            .is_mutable_lvalue = is_mutable_lvalue,
+        };
+    }
+
+    ExprInfo make_function_info(const AST::Expr& expression, const FunctionSymbol* function) {
+        result_.resolved_functions[&expression] = function->full_name;
+        return ExprInfo {
+            .type = nullptr,
+            .function = function,
+            .is_lvalue = false,
+            .is_mutable_lvalue = false,
+        };
+    }
 
     [[nodiscard]] bool same_type(const TypePtr& left, const TypePtr& right) const {
         return left.get() == right.get();
@@ -284,45 +372,6 @@ class Analyzer {
         return make_error(range.begin, std::move(message));
     }
 
-    SemanticType to_public_type(const TypePtr& type) const {
-        SemanticType result;
-        if (type == nullptr) {
-            return result;
-        }
-
-        result.kind = type->kind == TypeKind::Struct ? SemanticTypeKind::Struct
-                                                     : SemanticTypeKind::Builtin;
-        result.name = type->name;
-        return result;
-    }
-
-    void annotate_expr(const AST::Expr& expression, const TypePtr& type) {
-        if (type != nullptr) {
-            result_.expr_types[&expression] = to_public_type(type);
-        }
-    }
-
-    ExprInfo make_value_info(const AST::Expr& expression, const TypePtr& type,
-                             bool is_lvalue = false, bool is_mutable_lvalue = false) {
-        annotate_expr(expression, type);
-        return ExprInfo {
-            .type = type,
-            .function = nullptr,
-            .is_lvalue = is_lvalue,
-            .is_mutable_lvalue = is_mutable_lvalue,
-        };
-    }
-
-    ExprInfo make_function_info(const AST::Expr& expression, const FunctionSymbol* function) {
-        result_.resolved_functions[&expression] = function->full_name;
-        return ExprInfo {
-            .type = nullptr,
-            .function = function,
-            .is_lvalue = false,
-            .is_mutable_lvalue = false,
-        };
-    }
-
     std::expected<void, SemanticError> register_name(const std::string& full_name,
                                                      const Lexer::SourceRange& range,
                                                      const std::string& kind) {
@@ -330,6 +379,7 @@ class Analyzer {
             return std::unexpected(
                 make_error(range, "duplicate declaration of " + kind + " '" + full_name + '\''));
         }
+
         return {};
     }
 
@@ -354,8 +404,8 @@ class Analyzer {
             }
 
             if (const auto* structure = dynamic_cast<const AST::StructDecl*>(declaration.get())) {
-                const auto full_name =
-                    join_path(append_path(namespace_path, std::vector<std::string> {structure->name}));
+                const auto full_name = join_path(
+                    append_path(namespace_path, std::vector<std::string> {structure->name}));
                 auto registered = register_name(full_name, structure->range, "struct");
                 if (!registered) {
                     return std::unexpected(registered.error());
@@ -393,6 +443,13 @@ class Analyzer {
             if (const auto* name_space = dynamic_cast<const AST::NamespaceDecl*>(declaration.get())) {
                 const auto full_path =
                     append_path(namespace_path, std::vector<std::string> {name_space->name});
+                const auto full_name = join_path(full_path);
+                auto registered = register_name(full_name, name_space->range, "namespace");
+                if (!registered) {
+                    return std::unexpected(registered.error());
+                }
+                namespaces_.insert(full_name);
+
                 auto nested = collect_declarations(name_space->declarations, full_path);
                 if (!nested) {
                     return std::unexpected(nested.error());
@@ -429,6 +486,7 @@ class Analyzer {
                 return candidate;
             }
         }
+
         return std::nullopt;
     }
 
@@ -438,6 +496,7 @@ class Analyzer {
                 return candidate;
             }
         }
+
         return std::nullopt;
     }
 
@@ -447,27 +506,39 @@ class Analyzer {
                 return candidate;
             }
         }
+
         return std::nullopt;
     }
 
     std::expected<TypePtr, SemanticError> resolve_type_syntax(const AST::TypeSyntax& syntax,
                                                               bool allow_void) {
+        TypePtr type;
+
         if (syntax.array_size.has_value()) {
             return std::unexpected(
-                make_error(syntax.range, "TODO: array types are not implemented in this stage"));
+                make_error(syntax.range, "TODO: array types are not implemented at stage 5"));
         }
 
-        TypePtr type;
         if (syntax.name_parts.size() == 1 && is_builtin_type_name(syntax.name_parts.front())) {
             type = builtin_type(syntax.name_parts.front());
         } else if (const auto alias_name = lookup_alias_name(syntax.name_parts)) {
-            auto resolved = resolve_alias(*aliases_.at(*alias_name));
+            const auto alias_it = aliases_.find(*alias_name);
+            if (alias_it == aliases_.end()) {
+                return std::unexpected(make_error(
+                    syntax.range, "internal error: unresolved alias '" + *alias_name + '\''));
+            }
+            auto resolved = resolve_alias(*alias_it->second);
             if (!resolved) {
                 return std::unexpected(resolved.error());
             }
             type = *resolved;
         } else if (const auto struct_name = lookup_struct_name(syntax.name_parts)) {
-            type = structs_.at(*struct_name)->type;
+            const auto struct_it = structs_.find(*struct_name);
+            if (struct_it == structs_.end()) {
+                return std::unexpected(make_error(
+                    syntax.range, "internal error: unresolved struct '" + *struct_name + '\''));
+            }
+            type = struct_it->second->type;
         } else {
             return std::unexpected(
                 make_error(syntax.range, "unknown type '" + join_path(syntax.name_parts) + '\''));
@@ -477,6 +548,23 @@ class Analyzer {
             return std::unexpected(make_error(syntax.range, "type 'void' is not allowed here"));
         }
 
+        return type;
+    }
+
+    TypePtr get_array_type(const TypePtr& element_type, std::size_t size) {
+        const auto key = element_type->name + '[' + std::to_string(size) + ']';
+        const auto it = array_types_.find(key);
+        if (it != array_types_.end()) {
+            return it->second;
+        }
+
+        auto type = std::make_shared<Type>(Type {
+            .kind = TypeKind::Array,
+            .name = key,
+            .element_type = element_type,
+            .array_size = size,
+        });
+        array_types_.emplace(key, type);
         return type;
     }
 
@@ -498,6 +586,7 @@ class Analyzer {
 
         current_namespace_ = saved_namespace;
         alias.resolving = false;
+
         if (!resolved) {
             return std::unexpected(resolved.error());
         }
@@ -559,6 +648,7 @@ class Analyzer {
             });
         }
         result_.structs[structure.decl] = std::move(info);
+
         return {};
     }
 
@@ -589,9 +679,9 @@ class Analyzer {
         }
 
         auto return_type = resolve_type_syntax(*function.decl->return_type, true);
-
         current_namespace_ = saved_namespace;
         function.resolving = false;
+
         if (!return_type) {
             return std::unexpected(return_type.error());
         }
@@ -633,7 +723,15 @@ class Analyzer {
 
             const auto full_name =
                 join_path(append_path(current_namespace_, std::vector<std::string> {function->name}));
-            auto analyzed = analyze_function(*functions_.at(full_name));
+            const auto function_it = functions_.find(full_name);
+            if (function_it == functions_.end()) {
+                return std::unexpected(make_error(
+                    function->range,
+                    "internal error: missing function symbol for '" + full_name + '\''));
+            }
+            auto* symbol = function_it->second.get();
+
+            auto analyzed = analyze_function(*symbol);
             if (!analyzed) {
                 return std::unexpected(analyzed.error());
             }
@@ -650,10 +748,12 @@ class Analyzer {
 
         const auto saved_namespace = current_namespace_;
         const auto saved_return_type = current_return_type_;
+        const auto saved_function_name = current_function_name_;
         const auto saved_loop_depth = loop_depth_;
 
         current_namespace_ = function.namespace_path;
         current_return_type_ = function.return_type;
+        current_function_name_ = function.full_name;
         loop_depth_ = 0;
         local_scopes_.clear();
         push_scope();
@@ -662,7 +762,11 @@ class Analyzer {
         for (std::size_t i = 0; i < function.decl->parameters.size(); ++i) {
             const auto& parameter = function.decl->parameters[i];
             if (!parameter_names.insert(parameter.name).second) {
-                restore_function_state(saved_namespace, saved_return_type, saved_loop_depth);
+                pop_scope();
+                current_namespace_ = saved_namespace;
+                current_return_type_ = saved_return_type;
+                current_function_name_ = saved_function_name;
+                loop_depth_ = saved_loop_depth;
                 return std::unexpected(
                     make_error(parameter.range, "duplicate parameter '" + parameter.name + '\''));
             }
@@ -675,36 +779,38 @@ class Analyzer {
                               },
                               parameter.range);
             if (!declared) {
-                restore_function_state(saved_namespace, saved_return_type, saved_loop_depth);
+                pop_scope();
+                current_namespace_ = saved_namespace;
+                current_return_type_ = saved_return_type;
+                current_function_name_ = saved_function_name;
+                loop_depth_ = saved_loop_depth;
                 return std::unexpected(declared.error());
             }
         }
 
         auto returns = analyze_block(*function.decl->body, false);
-        restore_function_state(saved_namespace, saved_return_type, saved_loop_depth);
+        pop_scope();
+
+        current_namespace_ = saved_namespace;
+        current_return_type_ = saved_return_type;
+        current_function_name_ = saved_function_name;
+        loop_depth_ = saved_loop_depth;
+
         if (!returns) {
             return std::unexpected(returns.error());
         }
 
         if (!function.return_type->is_void() && !*returns) {
             return std::unexpected(make_error(function.decl->body->range,
-                                              "not all control paths return a value"));
+                                              "not all control paths in function '" +
+                                                  function.full_name + "' return a value"));
         }
 
         return {};
     }
 
-    void restore_function_state(const std::vector<std::string>& saved_namespace,
-                                const TypePtr& saved_return_type, int saved_loop_depth) {
-        if (!local_scopes_.empty()) {
-            local_scopes_.clear();
-        }
-        current_namespace_ = saved_namespace;
-        current_return_type_ = saved_return_type;
-        loop_depth_ = saved_loop_depth;
-    }
-
     void push_scope() { local_scopes_.push_back({}); }
+
     void pop_scope() { local_scopes_.pop_back(); }
 
     std::expected<void, SemanticError> declare_local(const std::string& name,
@@ -715,6 +821,7 @@ class Analyzer {
             return std::unexpected(
                 make_error(range, "duplicate declaration of local name '" + name + '\''));
         }
+
         scope.emplace(name, std::move(symbol));
         return {};
     }
@@ -726,6 +833,7 @@ class Analyzer {
                 return &found->second;
             }
         }
+
         return nullptr;
     }
 
@@ -747,12 +855,14 @@ class Analyzer {
                 }
                 return std::unexpected(statement_returns.error());
             }
+
             guarantees_return = *statement_returns;
         }
 
         if (create_scope) {
             pop_scope();
         }
+
         return guarantees_return;
     }
 
@@ -776,8 +886,8 @@ class Analyzer {
             if (!same_type(initializer->type, *variable_type)) {
                 return std::unexpected(make_error(
                     declaration->initializer->range,
-                    "initializer type '" + initializer->type->name +
-                        "' does not match variable type '" + (*variable_type)->name + '\''));
+                    "initializer type '" + initializer->type->name + "' does not match variable type '" +
+                        (*variable_type)->name + '\''));
             }
 
             auto declared = declare_local(
@@ -795,6 +905,7 @@ class Analyzer {
                 .type = to_public_type(*variable_type),
                 .is_mutable = declaration->mutability == AST::Mutability::Mutable,
             };
+
             return false;
         }
 
@@ -805,8 +916,8 @@ class Analyzer {
                 return std::unexpected(condition.error());
             }
             if (!same_type(condition->type, builtin_type("bool"))) {
-                return std::unexpected(make_error(if_stmt->condition->range,
-                                                  "if condition must have type 'bool'"));
+                return std::unexpected(
+                    make_error(if_stmt->condition->range, "if condition must have type 'bool'"));
             }
 
             auto then_returns = analyze_block(*if_stmt->then_branch, true);
@@ -843,14 +954,15 @@ class Analyzer {
             if (!analyzed_body) {
                 return std::unexpected(analyzed_body.error());
             }
+
             return false;
         }
 
         if (const auto* return_stmt = dynamic_cast<const AST::ReturnStmt*>(&statement)) {
             if (current_return_type_->is_void()) {
                 if (return_stmt->value) {
-                    return std::unexpected(
-                        make_error(return_stmt->value->range, "void function cannot return a value"));
+                    return std::unexpected(make_error(
+                        return_stmt->value->range, "void function cannot return a value"));
                 }
                 return true;
             }
@@ -865,13 +977,14 @@ class Analyzer {
             if (!value) {
                 return std::unexpected(value.error());
             }
+
             if (!same_type(value->type, current_return_type_)) {
                 return std::unexpected(make_error(
                     return_stmt->value->range,
-                    "return type '" + value->type->name +
-                        "' does not match function return type '" +
+                    "return type '" + value->type->name + "' does not match function return type '" +
                         current_return_type_->name + '\''));
             }
+
             return true;
         }
 
@@ -884,7 +997,8 @@ class Analyzer {
 
         if (dynamic_cast<const AST::ContinueStmt*>(&statement) != nullptr) {
             if (loop_depth_ <= 0) {
-                return std::unexpected(make_error(statement.range, "'continue' is only valid inside a loop"));
+                return std::unexpected(
+                    make_error(statement.range, "'continue' is only valid inside a loop"));
             }
             return false;
         }
@@ -894,11 +1008,13 @@ class Analyzer {
             if (!expression) {
                 return std::unexpected(expression.error());
             }
+
             if (expression->function != nullptr && expression->type == nullptr) {
                 return std::unexpected(make_error(
                     expression_stmt->expression->range,
                     "function name must be used in a call expression"));
             }
+
             return false;
         }
 
@@ -924,6 +1040,7 @@ class Analyzer {
             }
             return std::unexpected(make_error(expression.range, "expected a value expression"));
         }
+
         return info;
     }
 
@@ -937,7 +1054,13 @@ class Analyzer {
 
             if (const auto function_name =
                     lookup_function_name(std::vector<std::string> {identifier->name})) {
-                auto* function = functions_.at(*function_name).get();
+                const auto function_it = functions_.find(*function_name);
+                if (function_it == functions_.end()) {
+                    return std::unexpected(make_error(
+                        expression.range,
+                        "internal error: missing function symbol for '" + *function_name + '\''));
+                }
+                auto* function = function_it->second.get();
                 auto resolved = resolve_function_signature(*function);
                 if (!resolved) {
                     return std::unexpected(resolved.error());
@@ -951,7 +1074,13 @@ class Analyzer {
 
         if (const auto* access = dynamic_cast<const AST::NamespaceAccessExpr*>(&expression)) {
             if (const auto function_name = lookup_function_name(access->path)) {
-                auto* function = functions_.at(*function_name).get();
+                const auto function_it = functions_.find(*function_name);
+                if (function_it == functions_.end()) {
+                    return std::unexpected(make_error(
+                        expression.range,
+                        "internal error: missing function symbol for '" + *function_name + '\''));
+                }
+                auto* function = function_it->second.get();
                 auto resolved = resolve_function_signature(*function);
                 if (!resolved) {
                     return std::unexpected(resolved.error());
@@ -959,28 +1088,40 @@ class Analyzer {
                 return make_function_info(expression, function);
             }
 
-            return std::unexpected(make_error(
-                expression.range,
-                "TODO: namespace access is supported only for function calls in this stage"));
+            return std::unexpected(make_error(expression.range,
+                                              "namespace access '" + join_path(access->path) +
+                                                  "' does not resolve to a callable function"));
         }
 
         if (dynamic_cast<const AST::BoolLiteralExpr*>(&expression) != nullptr) {
             return make_value_info(expression, builtin_type("bool"));
         }
+
         if (dynamic_cast<const AST::StringLiteralExpr*>(&expression) != nullptr) {
             return make_value_info(expression, builtin_type("string"));
         }
+
         if (dynamic_cast<const AST::IntLiteralExpr*>(&expression) != nullptr) {
             if (expected_type != nullptr && expected_type->is_integer()) {
                 return make_value_info(expression, expected_type);
             }
             return make_value_info(expression, builtin_type("int32"));
         }
+
         if (dynamic_cast<const AST::FloatLiteralExpr*>(&expression) != nullptr) {
             if (expected_type != nullptr && expected_type->is_float()) {
                 return make_value_info(expression, expected_type);
             }
             return make_value_info(expression, builtin_type("float64"));
+        }
+
+        if (dynamic_cast<const AST::ArrayLiteralExpr*>(&expression) != nullptr) {
+            return std::unexpected(
+                make_error(expression.range, "TODO: array literals are not implemented at stage 5"));
+        }
+
+        if (const auto* struct_literal = dynamic_cast<const AST::StructLiteralExpr*>(&expression)) {
+            return analyze_struct_literal(*struct_literal);
         }
 
         if (const auto* unary = dynamic_cast<const AST::UnaryExpr*>(&expression)) {
@@ -991,8 +1132,8 @@ class Analyzer {
 
             if (unary->op_type == Lexer::TokenType::Minus) {
                 if (!operand->type->is_numeric()) {
-                    return std::unexpected(make_error(expression.range,
-                                                      "unary '-' requires a numeric operand"));
+                    return std::unexpected(
+                        make_error(expression.range, "unary '-' requires a numeric operand"));
                 }
                 return make_value_info(expression, operand->type);
             }
@@ -1008,8 +1149,46 @@ class Analyzer {
             return std::unexpected(make_error(expression.range, "unsupported unary operator"));
         }
 
+        if (const auto* cast = dynamic_cast<const AST::CastExpr*>(&expression)) {
+            return std::unexpected(
+                make_error(expression.range, "TODO: cast expressions are not implemented at stage 5"));
+        }
+
         if (const auto* binary = dynamic_cast<const AST::BinaryExpr*>(&expression)) {
             return analyze_binary_expression(*binary);
+        }
+
+        if (const auto* index = dynamic_cast<const AST::IndexExpr*>(&expression)) {
+            return std::unexpected(
+                make_error(expression.range, "TODO: array indexing is not implemented at stage 5"));
+        }
+
+        if (const auto* field = dynamic_cast<const AST::FieldAccessExpr*>(&expression)) {
+            auto base = analyze_value_expression(*field->base, nullptr, "struct base");
+            if (!base) {
+                return std::unexpected(base.error());
+            }
+
+            if (base->type->kind != TypeKind::Struct || base->type->struct_symbol == nullptr) {
+                return std::unexpected(
+                    make_error(field->base->range, "field access requires a struct operand"));
+            }
+
+            auto fields_resolved = resolve_struct_fields(*base->type->struct_symbol);
+            if (!fields_resolved) {
+                return std::unexpected(fields_resolved.error());
+            }
+
+            for (const auto& member : base->type->struct_symbol->fields) {
+                if (member.name == field->field) {
+                    return make_value_info(expression, member.type, base->is_lvalue,
+                                           base->is_mutable_lvalue);
+                }
+            }
+
+            return std::unexpected(make_error(
+                expression.range, "struct type '" + base->type->name + "' has no field '" +
+                                      field->field + '\''));
         }
 
         if (const auto* assignment = dynamic_cast<const AST::AssignmentExpr*>(&expression)) {
@@ -1023,12 +1202,14 @@ class Analyzer {
             if (!value) {
                 return std::unexpected(value.error());
             }
+
             if (!same_type(value->type, target->type)) {
                 return std::unexpected(make_error(
                     assignment->value->range,
-                    "cannot assign value of type '" + value->type->name +
-                        "' to target of type '" + target->type->name + '\''));
+                    "cannot assign value of type '" + value->type->name + "' to target of type '" +
+                        target->type->name + '\''));
             }
+
             return make_value_info(expression, target->type);
         }
 
@@ -1037,48 +1218,24 @@ class Analyzer {
             if (!callee) {
                 return std::unexpected(callee.error());
             }
+
             if (callee->function == nullptr) {
-                return std::unexpected(make_error(call->callee->range, "expression is not callable"));
+                return std::unexpected(
+                    make_error(call->callee->range, "expression is not callable"));
             }
-            return analyze_call(*call, *callee->function);
-        }
 
-        if (dynamic_cast<const AST::CastExpr*>(&expression) != nullptr) {
-            return std::unexpected(make_error(expression.range,
-                                              "TODO: cast expressions are not implemented in this stage"));
-        }
+            auto call_checked = analyze_call(*call, *callee->function);
+            if (!call_checked) {
+                return std::unexpected(call_checked.error());
+            }
 
-        if (dynamic_cast<const AST::IndexExpr*>(&expression) != nullptr) {
-            return std::unexpected(make_error(expression.range,
-                                              "TODO: array indexing is not implemented in this stage"));
-        }
-
-        if (dynamic_cast<const AST::FieldAccessExpr*>(&expression) != nullptr) {
-            return std::unexpected(make_error(expression.range,
-                                              "TODO: field access is not implemented in this stage"));
-        }
-
-        if (dynamic_cast<const AST::ArrayLiteralExpr*>(&expression) != nullptr) {
-            return std::unexpected(make_error(expression.range,
-                                              "TODO: array literals are not implemented in this stage"));
-        }
-
-        if (dynamic_cast<const AST::StructLiteralExpr*>(&expression) != nullptr) {
-            return std::unexpected(make_error(
-                expression.range, "TODO: struct literals are not implemented in this stage"));
+            return *call_checked;
         }
 
         return std::unexpected(make_error(expression.range, "unsupported expression kind"));
     }
 
     std::expected<ExprInfo, SemanticError> analyze_assignment_target(const AST::Expr& expression) {
-        // В промежуточной версии разрешаем присваивание только локальной переменной.
-        if (dynamic_cast<const AST::IdentifierExpr*>(&expression) == nullptr) {
-            return std::unexpected(make_error(
-                expression.range,
-                "TODO: only simple identifier assignment is implemented in this stage"));
-        }
-
         auto target = analyze_expression(expression);
         if (!target) {
             return std::unexpected(target.error());
@@ -1087,9 +1244,16 @@ class Analyzer {
         if (!target->is_lvalue) {
             return std::unexpected(make_error(expression.range, "invalid assignment target"));
         }
+
         if (!target->is_mutable_lvalue) {
-            return std::unexpected(make_error(expression.range, "cannot assign to an immutable value"));
+            return std::unexpected(
+                make_error(expression.range, "cannot assign to an immutable value"));
         }
+
+        if (target->type == nullptr) {
+            return std::unexpected(make_error(expression.range, "invalid assignment target"));
+        }
+
         return target;
     }
 
@@ -1104,19 +1268,22 @@ class Analyzer {
             }
             right = *analyzed_right;
 
-            auto analyzed_left = analyze_value_expression(*binary.left, right.type, "left operand");
+            auto analyzed_left =
+                analyze_value_expression(*binary.left, right.type, "left operand");
             if (!analyzed_left) {
                 return std::unexpected(analyzed_left.error());
             }
             left = *analyzed_left;
         } else {
-            auto analyzed_left = analyze_value_expression(*binary.left, nullptr, "left operand");
+            auto analyzed_left =
+                analyze_value_expression(*binary.left, nullptr, "left operand");
             if (!analyzed_left) {
                 return std::unexpected(analyzed_left.error());
             }
             left = *analyzed_left;
 
-            auto analyzed_right = analyze_value_expression(*binary.right, left.type, "right operand");
+            auto analyzed_right =
+                analyze_value_expression(*binary.right, left.type, "right operand");
             if (!analyzed_right) {
                 return std::unexpected(analyzed_right.error());
             }
@@ -1177,28 +1344,158 @@ class Analyzer {
         }
     }
 
+    std::expected<ExprInfo, SemanticError> analyze_array_literal(const AST::ArrayLiteralExpr& literal,
+                                                                 TypePtr expected_type) {
+        if (expected_type != nullptr) {
+            if (expected_type->kind != TypeKind::Array) {
+                return std::unexpected(make_error(
+                    literal.range, "array literal is not compatible with type '" +
+                                       expected_type->name + '\''));
+            }
+
+            if (literal.elements.size() != expected_type->array_size) {
+                return std::unexpected(make_error(
+                    literal.range,
+                    "array literal has " + std::to_string(literal.elements.size()) +
+                        " element(s), but type '" + expected_type->name + "' requires " +
+                        std::to_string(expected_type->array_size)));
+            }
+
+            for (const auto& element : literal.elements) {
+                auto analyzed =
+                    analyze_value_expression(*element, expected_type->element_type, "array element");
+                if (!analyzed) {
+                    return std::unexpected(analyzed.error());
+                }
+                if (!same_type(analyzed->type, expected_type->element_type)) {
+                    return std::unexpected(make_error(
+                        element->range,
+                        "array element type '" + analyzed->type->name +
+                            "' does not match expected type '" +
+                            expected_type->element_type->name + '\''));
+                }
+            }
+
+            return make_value_info(literal, expected_type);
+        }
+
+        if (literal.elements.empty()) {
+            return std::unexpected(
+                make_error(literal.range, "cannot infer the type of an empty array literal"));
+        }
+
+        auto first = analyze_value_expression(*literal.elements.front(), nullptr, "array element");
+        if (!first) {
+            return std::unexpected(first.error());
+        }
+
+        const auto element_type = first->type;
+        for (std::size_t i = 1; i < literal.elements.size(); ++i) {
+            auto element = analyze_value_expression(*literal.elements[i], element_type, "array element");
+            if (!element) {
+                return std::unexpected(element.error());
+            }
+            if (!same_type(element->type, element_type)) {
+                return std::unexpected(make_error(
+                    literal.elements[i]->range,
+                    "array literal elements must all have the same type"));
+            }
+        }
+
+        return make_value_info(literal, get_array_type(element_type, literal.elements.size()));
+    }
+
+    std::expected<ExprInfo, SemanticError> analyze_struct_literal(
+        const AST::StructLiteralExpr& literal) {
+        const auto struct_name = lookup_struct_name(literal.type_path);
+        if (!struct_name) {
+            return std::unexpected(
+                make_error(literal.range, "unknown struct type '" + join_path(literal.type_path) + '\''));
+        }
+
+        const auto struct_it = structs_.find(*struct_name);
+        if (struct_it == structs_.end()) {
+            return std::unexpected(make_error(
+                literal.range, "internal error: missing struct symbol for '" + *struct_name + '\''));
+        }
+        auto& structure = *struct_it->second;
+        auto resolved_fields = resolve_struct_fields(structure);
+        if (!resolved_fields) {
+            return std::unexpected(resolved_fields.error());
+        }
+
+        std::unordered_map<std::string, const FieldSymbol*> fields_by_name;
+        for (const auto& field : structure.fields) {
+            fields_by_name.emplace(field.name, &field);
+        }
+
+        std::unordered_set<std::string> seen_fields;
+        for (const auto& field : literal.fields) {
+            if (!seen_fields.insert(field.name).second) {
+                return std::unexpected(
+                    make_error(field.range, "duplicate initializer for field '" + field.name + '\''));
+            }
+
+            const auto it = fields_by_name.find(field.name);
+            if (it == fields_by_name.end()) {
+                return std::unexpected(make_error(
+                    field.range, "struct '" + structure.full_name + "' has no field '" + field.name + '\''));
+            }
+
+            auto value =
+                analyze_value_expression(*field.value, it->second->type, "struct field initializer");
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+
+            if (!same_type(value->type, it->second->type)) {
+                return std::unexpected(make_error(
+                    field.value->range,
+                    "initializer for field '" + field.name + "' has type '" + value->type->name +
+                        "', expected '" + it->second->type->name + '\''));
+            }
+        }
+
+        if (seen_fields.size() != structure.fields.size()) {
+            for (const auto& field : structure.fields) {
+                if (!seen_fields.contains(field.name)) {
+                    return std::unexpected(make_error(
+                        literal.range, "missing initializer for field '" + field.name + '\''));
+                }
+            }
+        }
+
+        return make_value_info(literal, structure.type);
+    }
+
     std::expected<ExprInfo, SemanticError> analyze_call(const AST::CallExpr& call,
                                                         const FunctionSymbol& function) {
         switch (function.builtin_kind) {
             case BuiltinKind::Print: {
                 if (call.arguments.size() != 1) {
-                    return std::unexpected(make_error(call.range, "'print' expects exactly 1 argument"));
+                    return std::unexpected(
+                        make_error(call.range, "'print' expects exactly 1 argument"));
                 }
-                auto argument = analyze_value_expression(*call.arguments[0], nullptr, "builtin argument");
+
+                auto argument =
+                    analyze_value_expression(*call.arguments[0], nullptr, "builtin argument");
                 if (!argument) {
                     return std::unexpected(argument.error());
                 }
+
                 if (!is_printable_type(argument->type)) {
                     return std::unexpected(make_error(
                         call.arguments[0]->range,
                         "'print' only accepts integer, floating-point, bool, or string values"));
                 }
+
                 return make_value_info(call, builtin_type("void"));
             }
 
             case BuiltinKind::Input:
                 if (!call.arguments.empty()) {
-                    return std::unexpected(make_error(call.range, "'input' expects no arguments"));
+                    return std::unexpected(
+                        make_error(call.range, "'input' expects no arguments"));
                 }
                 return make_value_info(call, builtin_type("string"));
 
@@ -1206,15 +1503,18 @@ class Analyzer {
                 if (call.arguments.size() != 1) {
                     return std::unexpected(make_error(call.range, "'len' expects exactly 1 argument"));
                 }
-                auto argument =
-                    analyze_value_expression(*call.arguments[0], builtin_type("string"), "builtin argument");
+
+                auto argument = analyze_value_expression(*call.arguments[0], builtin_type("string"),
+                                                         "builtin argument");
                 if (!argument) {
                     return std::unexpected(argument.error());
                 }
+
                 if (!same_type(argument->type, builtin_type("string"))) {
-                    return std::unexpected(make_error(call.arguments[0]->range,
-                                                      "'len' expects an argument of type 'string'"));
+                    return std::unexpected(
+                        make_error(call.arguments[0]->range, "'len' expects an argument of type 'string'"));
                 }
+
                 return make_value_info(call, builtin_type("int32"));
             }
 
@@ -1222,31 +1522,38 @@ class Analyzer {
                 if (call.arguments.size() != 1) {
                     return std::unexpected(make_error(call.range, "'exit' expects exactly 1 argument"));
                 }
-                auto argument =
-                    analyze_value_expression(*call.arguments[0], builtin_type("int32"), "builtin argument");
+
+                auto argument = analyze_value_expression(*call.arguments[0], builtin_type("int32"),
+                                                         "builtin argument");
                 if (!argument) {
                     return std::unexpected(argument.error());
                 }
+
                 if (!same_type(argument->type, builtin_type("int32"))) {
-                    return std::unexpected(make_error(call.arguments[0]->range,
-                                                      "'exit' expects an argument of type 'int32'"));
+                    return std::unexpected(
+                        make_error(call.arguments[0]->range, "'exit' expects an argument of type 'int32'"));
                 }
+
                 return make_value_info(call, builtin_type("void"));
             }
 
             case BuiltinKind::Panic: {
                 if (call.arguments.size() != 1) {
-                    return std::unexpected(make_error(call.range, "'panic' expects exactly 1 argument"));
+                    return std::unexpected(
+                        make_error(call.range, "'panic' expects exactly 1 argument"));
                 }
-                auto argument =
-                    analyze_value_expression(*call.arguments[0], builtin_type("string"), "builtin argument");
+
+                auto argument = analyze_value_expression(*call.arguments[0], builtin_type("string"),
+                                                         "builtin argument");
                 if (!argument) {
                     return std::unexpected(argument.error());
                 }
+
                 if (!same_type(argument->type, builtin_type("string"))) {
-                    return std::unexpected(make_error(call.arguments[0]->range,
-                                                      "'panic' expects an argument of type 'string'"));
+                    return std::unexpected(make_error(
+                        call.arguments[0]->range, "'panic' expects an argument of type 'string'"));
                 }
+
                 return make_value_info(call, builtin_type("void"));
             }
 
@@ -1263,11 +1570,12 @@ class Analyzer {
         }
 
         for (std::size_t i = 0; i < call.arguments.size(); ++i) {
-            auto argument =
-                analyze_value_expression(*call.arguments[i], function.parameter_types[i], "function argument");
+            auto argument = analyze_value_expression(*call.arguments[i], function.parameter_types[i],
+                                                     "function argument");
             if (!argument) {
                 return std::unexpected(argument.error());
             }
+
             if (!same_type(argument->type, function.parameter_types[i])) {
                 return std::unexpected(make_error(
                     call.arguments[i]->range,
