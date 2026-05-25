@@ -14,28 +14,33 @@ namespace AST {
 using SourceRange = Lexer::SourceRange;
 using TokenType = Lexer::TokenType;
 
+//базовый класс для ВСЕГО дерева
 struct Node {
     explicit Node(SourceRange source_range);
     virtual ~Node() = default;
 
     SourceRange range;
 
-    virtual void dump(std::ostream& out, int indent) const = 0;
+    virtual void dump(std::ostream& out, int indent) const = 0; //каждый узел ОБЯЗАН уметь печатать себя
 };
 
+//можно ли менять переменную
 enum class Mutability {
     Mutable,
     Immutable,
 };
 
+//объявления
 struct Decl : Node {
     using Node::Node;
 };
 
+//операторы (действия)
 struct Stmt : Node {
     using Node::Node;
 };
 
+//выражения (то, что считается)
 struct Expr : Node {
     using Node::Node;
 };
@@ -74,6 +79,8 @@ struct FieldInitializer {
     void dump(std::ostream& out, int indent) const;
 };
 
+//program корень AST 
+//declarations список всего (функции, struct и т.д.)
 struct Program {
     std::vector<std::unique_ptr<Decl>> declarations;
 

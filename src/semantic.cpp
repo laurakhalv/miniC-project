@@ -37,7 +37,8 @@ std::vector<std::string> append_path(const std::vector<std::string>& prefix,
 bool is_builtin_type_name(std::string_view name) {
     return name == "int8" || name == "int16" || name == "int32" || name == "int64" ||
            name == "uint8" || name == "uint16" || name == "uint32" || name == "uint64" ||
-           name == "float32" || name == "float64" || name == "bool" || name == "string" ||
+           name == "float32" || name == "float64" || name == "bool" || name == "char" ||
+           name == "string" ||
            name == "void";
 }
 
@@ -51,6 +52,44 @@ bool is_float_literal_expr(const AST::Expr& expr) {
 
 bool is_numeric_literal_expr(const AST::Expr& expr) {
     return is_int_literal_expr(expr) || is_float_literal_expr(expr);
+}
+
+std::expected<std::size_t, std::string> parse_unsigned_integer_literal(std::string_view text) {
+    int base = 10;
+    std::size_t start = 0;
+
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        start = 2;
+    } else if (text.size() > 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) {
+        base = 2;
+        start = 2;
+    }
+
+    if (start == text.size()) {
+        return std::unexpected("missing digits");
+    }
+
+    std::size_t value = 0;
+    for (std::size_t i = start; i < text.size(); ++i) {
+        const char ch = text[i];
+        int digit = -1;
+        if (ch >= '0' && ch <= '9') {
+            digit = ch - '0';
+        } else if (ch >= 'a' && ch <= 'f') {
+            digit = 10 + (ch - 'a');
+        } else if (ch >= 'A' && ch <= 'F') {
+            digit = 10 + (ch - 'A');
+        }
+
+        if (digit < 0 || digit >= base) {
+            return std::unexpected("invalid digit");
+        }
+
+        value = value * static_cast<std::size_t>(base) + static_cast<std::size_t>(digit);
+    }
+
+    return value;
 }
 
 }  // namespace
@@ -86,6 +125,7 @@ class Analyzer {
 
         [[nodiscard]] bool is_void() const { return kind == TypeKind::Builtin && name == "void"; }
         [[nodiscard]] bool is_bool() const { return kind == TypeKind::Builtin && name == "bool"; }
+        [[nodiscard]] bool is_char() const { return kind == TypeKind::Builtin && name == "char"; }
         [[nodiscard]] bool is_string() const {
             return kind == TypeKind::Builtin && name == "string";
         }
@@ -111,6 +151,7 @@ class Analyzer {
         Len,
         Exit,
         Panic,
+        Assert,
     };
 
     struct FieldSymbol {
@@ -255,6 +296,7 @@ class Analyzer {
         register_builtin_type("float32");
         register_builtin_type("float64");
         register_builtin_type("bool");
+        register_builtin_type("char");
         register_builtin_type("string");
         register_builtin_type("void");
 
@@ -263,6 +305,7 @@ class Analyzer {
         register_builtin_function("len", BuiltinKind::Len, builtin_type("int32"));
         register_builtin_function("exit", BuiltinKind::Exit, builtin_type("void"));
         register_builtin_function("panic", BuiltinKind::Panic, builtin_type("void"));
+        register_builtin_function("assert", BuiltinKind::Assert, builtin_type("void"));
     }
 
     void register_builtin_type(std::string name) {
@@ -355,7 +398,48 @@ class Analyzer {
     }
 
     [[nodiscard]] bool is_printable_type(const TypePtr& type) const {
-        return type != nullptr && (type->is_numeric() || type->is_bool() || type->is_string());
+        return type != nullptr &&
+               (type->is_numeric() || type->is_bool() || type->is_char() || type->is_string());
+    }
+
+    std::expected<bool, SemanticError> supports_equality(const TypePtr& type,
+                                                         const Lexer::SourceRange& range) {
+        if (type == nullptr) {
+            return false;
+        }
+
+        if (type->is_numeric() || type->is_bool() || type->is_char() || type->is_string()) {
+            return true;
+        }
+
+        if (type->kind == TypeKind::Array) {
+            return supports_equality(type->element_type, range);
+        }
+
+        if (type->kind == TypeKind::Struct) {
+            if (type->struct_symbol == nullptr) {
+                return std::unexpected(
+                    make_error(range, "internal error: unresolved struct in equality check"));
+            }
+
+            auto resolved = resolve_struct_fields(*type->struct_symbol);
+            if (!resolved) {
+                return std::unexpected(resolved.error());
+            }
+
+            for (const auto& field : type->struct_symbol->fields) {
+                auto comparable = supports_equality(field.type, range);
+                if (!comparable) {
+                    return std::unexpected(comparable.error());
+                }
+                if (!*comparable) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        return false;
     }
 
     [[nodiscard]] SemanticError make_error(const Lexer::SourceLocation& location,
@@ -514,11 +598,6 @@ class Analyzer {
                                                               bool allow_void) {
         TypePtr type;
 
-        if (syntax.array_size.has_value()) {
-            return std::unexpected(
-                make_error(syntax.range, "TODO: array types are not implemented at stage 5"));
-        }
-
         if (syntax.name_parts.size() == 1 && is_builtin_type_name(syntax.name_parts.front())) {
             type = builtin_type(syntax.name_parts.front());
         } else if (const auto alias_name = lookup_alias_name(syntax.name_parts)) {
@@ -542,6 +621,22 @@ class Analyzer {
         } else {
             return std::unexpected(
                 make_error(syntax.range, "unknown type '" + join_path(syntax.name_parts) + '\''));
+        }
+
+        if (syntax.array_size.has_value()) {
+            if (type->is_void()) {
+                return std::unexpected(
+                    make_error(syntax.range, "array element type cannot be 'void'"));
+            }
+
+            std::size_t size = 0;
+            auto parsed = parse_unsigned_integer_literal(*syntax.array_size);
+            if (!parsed) {
+                return std::unexpected(make_error(syntax.range, "invalid array size"));
+            }
+            size = *parsed;
+
+            return get_array_type(type, size);
         }
 
         if (!allow_void && type->is_void()) {
@@ -1101,6 +1196,10 @@ class Analyzer {
             return make_value_info(expression, builtin_type("string"));
         }
 
+        if (dynamic_cast<const AST::CharLiteralExpr*>(&expression) != nullptr) {
+            return make_value_info(expression, builtin_type("char"));
+        }
+
         if (dynamic_cast<const AST::IntLiteralExpr*>(&expression) != nullptr) {
             if (expected_type != nullptr && expected_type->is_integer()) {
                 return make_value_info(expression, expected_type);
@@ -1115,9 +1214,8 @@ class Analyzer {
             return make_value_info(expression, builtin_type("float64"));
         }
 
-        if (dynamic_cast<const AST::ArrayLiteralExpr*>(&expression) != nullptr) {
-            return std::unexpected(
-                make_error(expression.range, "TODO: array literals are not implemented at stage 5"));
+        if (const auto* array_literal = dynamic_cast<const AST::ArrayLiteralExpr*>(&expression)) {
+            return analyze_array_literal(*array_literal, std::move(expected_type));
         }
 
         if (const auto* struct_literal = dynamic_cast<const AST::StructLiteralExpr*>(&expression)) {
@@ -1150,8 +1248,30 @@ class Analyzer {
         }
 
         if (const auto* cast = dynamic_cast<const AST::CastExpr*>(&expression)) {
-            return std::unexpected(
-                make_error(expression.range, "TODO: cast expressions are not implemented at stage 5"));
+            auto target_type = resolve_type_syntax(*cast->target_type, false);
+            if (!target_type) {
+                return std::unexpected(target_type.error());
+            }
+
+            auto operand = analyze_value_expression(*cast->expression, nullptr, "cast operand");
+            if (!operand) {
+                return std::unexpected(operand.error());
+            }
+
+            const bool allowed_numeric_cast =
+                operand->type->is_numeric() && (*target_type)->is_numeric();
+            const bool allowed_to_string =
+                (*target_type)->is_string() &&
+                (operand->type->is_numeric() || operand->type->is_bool() || operand->type->is_char());
+
+            if (!allowed_numeric_cast && !allowed_to_string) {
+                return std::unexpected(make_error(
+                    expression.range,
+                    "cannot cast from '" + operand->type->name + "' to '" + (*target_type)->name +
+                        '\''));
+            }
+
+            return make_value_info(expression, *target_type);
         }
 
         if (const auto* binary = dynamic_cast<const AST::BinaryExpr*>(&expression)) {
@@ -1159,8 +1279,28 @@ class Analyzer {
         }
 
         if (const auto* index = dynamic_cast<const AST::IndexExpr*>(&expression)) {
-            return std::unexpected(
-                make_error(expression.range, "TODO: array indexing is not implemented at stage 5"));
+            auto base = analyze_value_expression(*index->base, nullptr, "array base");
+            if (!base) {
+                return std::unexpected(base.error());
+            }
+
+            if (base->type->kind != TypeKind::Array) {
+                return std::unexpected(
+                    make_error(index->base->range, "indexing requires an array operand"));
+            }
+
+            auto index_value = analyze_value_expression(*index->index, nullptr, "array index");
+            if (!index_value) {
+                return std::unexpected(index_value.error());
+            }
+
+            if (!index_value->type->is_integer()) {
+                return std::unexpected(
+                    make_error(index->index->range, "array index must have an integer type"));
+            }
+
+            return make_value_info(expression, base->type->element_type, base->is_lvalue,
+                                   base->is_mutable_lvalue);
         }
 
         if (const auto* field = dynamic_cast<const AST::FieldAccessExpr*>(&expression)) {
@@ -1319,12 +1459,23 @@ class Analyzer {
 
             case Lexer::TokenType::EqualEqual:
             case Lexer::TokenType::BangEqual:
-                if (!same_type(left.type, right.type) ||
-                    !(left.type->is_numeric() || left.type->is_bool() || left.type->is_string())) {
+                if (!same_type(left.type, right.type)) {
                     return std::unexpected(make_error(
                         binary.range,
                         "operator '" + binary.op_lexeme +
                             "' requires comparable operands of the same type"));
+                }
+                {
+                    auto comparable = supports_equality(left.type, binary.range);
+                    if (!comparable) {
+                        return std::unexpected(comparable.error());
+                    }
+                    if (!*comparable) {
+                        return std::unexpected(make_error(
+                            binary.range,
+                            "operator '" + binary.op_lexeme +
+                                "' requires comparable operands of the same type"));
+                    }
                 }
                 return make_value_info(binary, builtin_type("bool"));
 
@@ -1486,7 +1637,7 @@ class Analyzer {
                 if (!is_printable_type(argument->type)) {
                     return std::unexpected(make_error(
                         call.arguments[0]->range,
-                        "'print' only accepts integer, floating-point, bool, or string values"));
+                        "'print' only accepts integer, floating-point, bool, char, or string values"));
                 }
 
                 return make_value_info(call, builtin_type("void"));
@@ -1504,15 +1655,16 @@ class Analyzer {
                     return std::unexpected(make_error(call.range, "'len' expects exactly 1 argument"));
                 }
 
-                auto argument = analyze_value_expression(*call.arguments[0], builtin_type("string"),
-                                                         "builtin argument");
+                auto argument = analyze_value_expression(*call.arguments[0], nullptr, "builtin argument");
                 if (!argument) {
                     return std::unexpected(argument.error());
                 }
 
-                if (!same_type(argument->type, builtin_type("string"))) {
+                if (!same_type(argument->type, builtin_type("string")) &&
+                    argument->type->kind != TypeKind::Array) {
                     return std::unexpected(
-                        make_error(call.arguments[0]->range, "'len' expects an argument of type 'string'"));
+                        make_error(call.arguments[0]->range,
+                                   "'len' expects an argument of type 'string' or an array"));
                 }
 
                 return make_value_info(call, builtin_type("int32"));
@@ -1552,6 +1704,27 @@ class Analyzer {
                 if (!same_type(argument->type, builtin_type("string"))) {
                     return std::unexpected(make_error(
                         call.arguments[0]->range, "'panic' expects an argument of type 'string'"));
+                }
+
+                return make_value_info(call, builtin_type("void"));
+            }
+
+            case BuiltinKind::Assert: {
+                if (call.arguments.size() != 1) {
+                    return std::unexpected(
+                        make_error(call.range, "'assert' expects exactly 1 argument"));
+                }
+
+                auto argument = analyze_value_expression(*call.arguments[0], builtin_type("bool"),
+                                                         "builtin argument");
+                if (!argument) {
+                    return std::unexpected(argument.error());
+                }
+
+                if (!same_type(argument->type, builtin_type("bool"))) {
+                    return std::unexpected(
+                        make_error(call.arguments[0]->range,
+                                   "'assert' expects an argument of type 'bool'"));
                 }
 
                 return make_value_info(call, builtin_type("void"));

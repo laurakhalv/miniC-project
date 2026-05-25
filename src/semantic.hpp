@@ -67,4 +67,4 @@ struct SemanticResult {
 std::expected<SemanticResult, SemanticError> analyze_program(
     const AST::Program& program, std::string filename = "<memory>");
 
-}
+} 
