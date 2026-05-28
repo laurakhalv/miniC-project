@@ -5,7 +5,7 @@
 namespace Lexer {
 
 std::string_view to_string(TokenType type) {
-    //нужен для отладки и для флага 
+    // Нужен для отладки и для флага --dump-tokens.
     switch (type) {
         case TokenType::EndOfFile:
             return "EndOfFile";
@@ -15,6 +15,8 @@ std::string_view to_string(TokenType type) {
             return "IntLiteral";
         case TokenType::FloatLiteral:
             return "FloatLiteral";
+        case TokenType::CharLiteral:
+            return "CharLiteral";
         case TokenType::StringLiteral:
             return "StringLiteral";
         case TokenType::Let:
@@ -69,6 +71,8 @@ std::string_view to_string(TokenType type) {
             return "Float64";
         case TokenType::Bool:
             return "Bool";
+        case TokenType::Char:
+            return "Char";
         case TokenType::String:
             return "String";
         case TokenType::Void:
@@ -133,11 +137,11 @@ std::string_view to_string(TokenType type) {
 }
 
 std::string format_error(const LexError& error) {
-    // все лексические ошибки приводятся к единому формату diagnostics
+    // Все лексические ошибки приводятся к единому формату diagnostics.
     std::ostringstream stream;
     stream << error.filename << ':' << error.location.line << ':' << error.location.column
            << ": error: " << error.message;
     return stream.str();
 }
 
-}  
+}   

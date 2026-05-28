@@ -14,37 +14,37 @@ namespace AST {
 using SourceRange = Lexer::SourceRange;
 using TokenType = Lexer::TokenType;
 
-//базовый класс для ВСЕГО дерева
 struct Node {
     explicit Node(SourceRange source_range);
     virtual ~Node() = default;
 
     SourceRange range;
 
-    virtual void dump(std::ostream& out, int indent) const = 0; //каждый узел ОБЯЗАН уметь печатать себя
+    // dump() используется для --dump-ast и печатает дерево в читаемом виде
+    virtual void dump(std::ostream& out, int indent) const = 0;
 };
 
-//можно ли менять переменную
 enum class Mutability {
     Mutable,
     Immutable,
 };
 
-//объявления
 struct Decl : Node {
     using Node::Node;
 };
 
-//операторы (действия)
+// Stmt - любой узел, который может стоять внутри блока как отдельная инструкция
 struct Stmt : Node {
     using Node::Node;
 };
 
-//выражения (то, что считается)
+// Expr -узел, который вычисляется в значение и может быть частью другого выражения
 struct Expr : Node {
     using Node::Node;
 };
 
+// TypeSyntax хранит имя типа в том виде, как оно записано в программе
+// Например: int32, Point, Math::Point, int32[3]
 struct TypeSyntax final : Node {
     std::vector<std::string> name_parts;
     std::optional<std::string> array_size;
@@ -79,14 +79,15 @@ struct FieldInitializer {
     void dump(std::ostream& out, int indent) const;
 };
 
-//program корень AST 
-//declarations список всего (функции, struct и т.д.)
 struct Program {
+    // declarations -корневой список top-level объявлений модуля
     std::vector<std::unique_ptr<Decl>> declarations;
 
     void dump(std::ostream& out) const;
 };
 
+// BlockStmt вводит локальную область видимости и содержит последовательность
+// инструкций внутри фигурных скобок
 struct BlockStmt final : Stmt {
     std::vector<std::unique_ptr<Stmt>> statements;
 
@@ -208,6 +209,7 @@ struct EmptyStmt final : Stmt {
 };
 
 struct AssignmentExpr final : Expr {
+    // target - что присваиваем, value - что записываем
     std::unique_ptr<Expr> target;
     std::unique_ptr<Expr> value;
 
@@ -218,6 +220,7 @@ struct AssignmentExpr final : Expr {
 };
 
 struct BinaryExpr final : Expr {
+    // В BinaryExpr сохраняем и вид оператора, и его текстовую форму
     TokenType op_type;
     std::string op_lexeme;
     std::unique_ptr<Expr> left;
@@ -281,6 +284,7 @@ struct FieldAccessExpr final : Expr {
 };
 
 struct IdentifierExpr final : Expr {
+    // Имя пока хранится как строка; смысл имени позже определяет semantic analysis
     std::string name;
 
     IdentifierExpr(SourceRange range, std::string identifier_name);
@@ -320,6 +324,14 @@ struct StringLiteralExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+struct CharLiteralExpr final : Expr {
+    std::string value;
+
+    CharLiteralExpr(SourceRange range, std::string literal_value);
+
+    void dump(std::ostream& out, int indent) const override;
+};
+
 struct BoolLiteralExpr final : Expr {
     bool value;
 
@@ -329,6 +341,7 @@ struct BoolLiteralExpr final : Expr {
 };
 
 struct StructLiteralExpr final : Expr {
+    // type_path хранит путь к типу буквально так, как он был записан в программе
     std::vector<std::string> type_path;
     std::vector<FieldInitializer> fields;
 
@@ -347,5 +360,3 @@ struct ArrayLiteralExpr final : Expr {
 };
 
 }  
-
-

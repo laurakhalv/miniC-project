@@ -6,27 +6,29 @@
 
 namespace Lexer {
 
-//позиция одного символа в исходном файле
+// Позиция одного символа в исходном файле.
 struct SourceLocation {
     std::size_t line = 1;
     std::size_t column = 1;
     std::size_t offset = 0;
 };
 
+// Полуинтервал [begin, end), который занимает токен или AST-узел.
 struct SourceRange {
     SourceLocation begin {};
     SourceLocation end {};
 };
 
 enum class TokenType {
-    // базовые классы токенов
+    // Базовые классы токенов.
     EndOfFile,
     Identifier,
     IntLiteral,
     FloatLiteral,
+    CharLiteral,
     StringLiteral,
 
-    // ключевые слова
+    // Ключевые слова.
     Let,
     Const,
     Func,
@@ -54,10 +56,11 @@ enum class TokenType {
     Float32,
     Float64,
     Bool,
+    Char,
     String,
     Void,
 
-    //операторы и разделители
+    // Операторы и разделители.
     Plus,
     Minus,
     Star,
@@ -87,12 +90,14 @@ enum class TokenType {
     Arrow,
 };
 
+// Token - это результат работы лексера: класс токена, его текст и место в исходнике.
 struct Token {
     TokenType type = TokenType::EndOfFile;
     std::string lexeme {};
     SourceRange range {};
 };
 
+// LexError хранит уже готовую информацию для diagnostics.
 struct LexError {
     std::string filename {};
     std::string message {};
@@ -102,4 +107,4 @@ struct LexError {
 std::string_view to_string(TokenType type);
 std::string format_error(const LexError& error);
 
-}
+} 

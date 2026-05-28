@@ -5,8 +5,8 @@
 
 namespace {
 
-// для сложных выражений берём диапазон от начала левой части до конца правой
-//  чтобы AST узел покрывал весь исходный фрагмент
+// Для составных узлов удобно брать диапазон от начала левой части
+// до конца правой, чтобы AST-узел покрывал весь исходный фрагмент
 Lexer::SourceRange combine_ranges(Lexer::SourceRange left, Lexer::SourceRange right) {
     return Lexer::SourceRange {.begin = left.begin, .end = right.end};
 }
@@ -28,8 +28,8 @@ Parser::Parser(std::vector<Lexer::Token> tokens, std::string filename)
 std::expected<AST::Program, ParseError> Parser::parse_program() {
     AST::Program program;
 
-    // на верхнем уровне разрешены только объявления,
-// поэтому читаем программу как список Decl до конца файла
+    // На верхнем уровне grammar допускает только декларации, поэтому
+    // программа разбирается как последовательность Decl до EOF
     while (!is_at_end()) {
         auto declaration_or_error = parse_declaration();
         if (!declaration_or_error) {
@@ -69,6 +69,7 @@ bool Parser::check(TokenType type) const {
 }
 
 bool Parser::match(TokenType type) {
+    // match() одновременно проверяет токен и продвигает parser вперёд
     if (!check(type)) {
         return false;
     }
@@ -77,6 +78,7 @@ bool Parser::match(TokenType type) {
 }
 
 bool Parser::match_any(std::initializer_list<TokenType> types) {
+    // удобно для групп операторов одного приоритета: +/-, */% и тд
     for (const auto type : types) {
         if (check(type)) {
             advance();
@@ -102,6 +104,8 @@ ParseError Parser::make_error(const Token& token, std::string message) const {
 }
 
 std::expected<std::unique_ptr<AST::Decl>, ParseError> Parser::parse_declaration() {
+    // Верхний уровень dispatch: смотрим на первый токен и понимаем,
+    //какой именно Decl должен идти дальше
     if (check(TokenType::Func)) {
         auto decl = parse_function_decl();
         if (!decl) {
@@ -154,6 +158,7 @@ std::expected<std::unique_ptr<AST::FunctionDecl>, ParseError> Parser::parse_func
     }
 
     std::vector<AST::Parameter> parameters;
+    // Параметры читаются как повторяющаяся последовательность "Type name"
     if (!check(TokenType::RightParen)) {
         while (true) {
             auto parameter_type = parse_type();
@@ -328,8 +333,8 @@ std::expected<std::unique_ptr<AST::TypeSyntax>, ParseError> Parser::parse_type()
     std::vector<std::string> parts;
     Lexer::SourceRange range {};
 
-    // тип может быть либо встроенным (int32,bool,итд) либо пользовательским
-    //или пользовательским именем, например Math::Point
+    // Тип может быть либо встроенным (int32, bool, ...), либо пользовательским
+    //именем/квалифицированным именем вроде Math::Point
     if (is_builtin_type_token(peek().type)) {
         const auto token = advance();
         parts.push_back(token.lexeme);
@@ -376,6 +381,7 @@ std::expected<Parser::ParsedPath, ParseError> Parser::parse_identifier_path() {
     };
 
     while (match(TokenType::ColonColon)) {
+        // Если встретили '::', значит читаем следующую часть квалифицированного имени.
         auto part = consume(TokenType::Identifier, "expected identifier after '::'");
         if (!part) {
             return std::unexpected(part.error());
@@ -413,7 +419,7 @@ std::expected<std::unique_ptr<AST::BlockStmt>, ParseError> Parser::parse_block()
 }
 
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_statement() {
-    //порядок проверок отражает grammar сначала конструкции с явным первым токеном, а если ничего не подошло,остаётся expression statement 
+    // Порядок проверок отражает grammar: сначала конструкции с явным первым токеном, а если ничего не подошло, остаётся expression statement
     if (check(TokenType::LeftBrace)) {
         auto block = parse_block();
         if (!block) {
@@ -458,6 +464,8 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_variable_dec
     const auto mutability = keyword.type == TokenType::Let ? AST::Mutability::Mutable
                                                            : AST::Mutability::Immutable;
 
+    // В grammar объявление локальной переменной имеет вид:
+    // let/const Type name = expression ;
     auto type = parse_type();
     if (!type) {
         return std::unexpected(type.error());
@@ -643,6 +651,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_empty_statem
 }
 
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_expression() {
+    // parse_expression() просто делегирует в верхний уровень приоритетов
     return parse_assignment_expression();
 }
 
@@ -652,7 +661,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_assignment_e
         return std::unexpected(left.error());
     }
 
-    // присваивание правоассоциативное, поэтому правую часть разбираем тем же способом
+    //Присваивание правоассоциативно, поэтому правую часть снова разбираем через parse_assignment_expression()
     if (!match(TokenType::Assign)) {
         return left;
     }
@@ -863,7 +872,8 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_postfix_expr
         return std::unexpected(expression.error());
     }
 
-    // рostfix-операции можно наращивать цепочкой call,index,field access поэтому после atom цикл продолжается, пока встречаются суффиксы
+    // Postfix-операции можно наращивать цепочкой: call, index, field access.
+    // Поэтому после atom цикл продолжается, пока встречаются соответствующие суффиксы
     while (true) {
         if (match(TokenType::LeftParen)) {
             std::vector<std::unique_ptr<AST::Expr>> arguments;
@@ -928,7 +938,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_postfix_expr
 }
 
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_atom() {
-    // аtom это самый нижний уровень выражений литералы, идентификаторы,
+    // Atom - это самый нижний уровень выражений: литералы, идентификаторы,
     // скобки и составные литералы
     if (match(TokenType::IntLiteral)) {
         const auto token = previous();
@@ -946,6 +956,12 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_atom() {
         const auto token = previous();
         return std::unique_ptr<AST::Expr>(
             std::make_unique<AST::StringLiteralExpr>(token.range, token.lexeme));
+    }
+
+    if (match(TokenType::CharLiteral)) {
+        const auto token = previous();
+        return std::unique_ptr<AST::Expr>(
+            std::make_unique<AST::CharLiteralExpr>(token.range, token.lexeme));
     }
 
     if (match(TokenType::True)) {
@@ -1104,6 +1120,7 @@ bool Parser::is_builtin_type_token(TokenType type) const {
         case TokenType::Float32:
         case TokenType::Float64:
         case TokenType::Bool:
+        case TokenType::Char:
         case TokenType::String:
         case TokenType::Void:
             return true;
@@ -1119,4 +1136,4 @@ bool Parser::is_assignable_expression(const AST::Expr& expr) const {
            dynamic_cast<const AST::FieldAccessExpr*>(&expr) != nullptr;
 }
 
-} 
+}  
