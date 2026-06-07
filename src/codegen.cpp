@@ -1,4 +1,6 @@
 #include "codegen.hpp"
+#include <bit>
+#include <cstdint>
 #include <cctype>
 #include <sstream>
 #include <string>
@@ -15,6 +17,22 @@ bool is_integer_name(std::string_view name) {
 
 bool is_unsigned_integer_name(std::string_view name) {
     return name == "uint8" || name == "uint16" || name == "uint32" || name == "uint64";
+}
+
+bool is_float_name(std::string_view name) {
+    return name == "float32" || name == "float64";
+}
+
+std::string format_u32_hex(std::uint32_t value) {
+    std::ostringstream stream;
+    stream << "0x" << std::hex << value;
+    return stream.str();
+}
+
+std::string format_u64_hex(std::uint64_t value) {
+    std::ostringstream stream;
+    stream << "0x" << std::hex << value;
+    return stream.str();
 }
 
 std::string mangle_name(std::string_view full_name) {
@@ -88,7 +106,7 @@ std::string escape_asm_string(std::string_view value) {
     return escaped;
 }
 
-} 
+}  
 
 namespace Codegen {
 
@@ -428,6 +446,10 @@ class Generator {
             return {};
         }
 
+        if (const auto* literal = dynamic_cast<const AST::FloatLiteralExpr*>(&expression)) {
+            return emit_float_literal(*literal, *type);
+        }
+
         if (const auto* unary = dynamic_cast<const AST::UnaryExpr*>(&expression)) {
             auto emitted = emit_expression(*unary->operand);
             if (!emitted) {
@@ -452,6 +474,18 @@ class Generator {
 
         if (const auto* call = dynamic_cast<const AST::CallExpr*>(&expression)) {
             return emit_call_expression(*call);
+        }
+
+        if (const auto* cast = dynamic_cast<const AST::CastExpr*>(&expression)) {
+            auto source_type = expression_type(*cast->expression);
+            if (!source_type) {
+                return std::unexpected(source_type.error());
+            }
+
+            if (type->name == "string") {
+                return emit_string_cast_expression(*cast->expression, *source_type);
+            }
+            return emit_numeric_cast_expression(*cast->expression, *source_type, *type);
         }
 
         if (const auto* assignment = dynamic_cast<const AST::AssignmentExpr*>(&expression)) {
@@ -555,6 +589,10 @@ class Generator {
         auto right_type = expression_type(*binary.right);
         if (!right_type) {
             return std::unexpected(right_type.error());
+        }
+
+        if (is_float_name(left_type->name) && left_type->name == right_type->name) {
+            return emit_float_binary_expression(binary, *left_type);
         }
 
         if (binary.op_type == Lexer::TokenType::Plus && left_type->name == "string" &&
@@ -736,6 +774,10 @@ class Generator {
             emit_body_line("call __minic_rt_print_string");
         } else if (argument_type->name == "bool") {
             emit_body_line("call __minic_rt_print_bool");
+        } else if (argument_type->name == "float32") {
+            emit_body_line("call __minic_rt_print_f32");
+        } else if (argument_type->name == "float64") {
+            emit_body_line("call __minic_rt_print_f64");
         } else if (is_integer_name(argument_type->name)) {
             emit_body_line("call __minic_rt_" +
                            std::string(is_unsigned_integer_name(argument_type->name)
@@ -801,6 +843,144 @@ class Generator {
         return {};
     }
 
+    [[nodiscard]] std::string runtime_float_name(const Semantic::SemanticType& type) const {
+        return type.name == "float32" ? "f32" : "f64";
+    }
+
+    [[nodiscard]] std::string runtime_integer_name(const Semantic::SemanticType& type) const {
+        return is_unsigned_integer_name(type.name) ? "u64" : "i64";
+    }
+
+    std::expected<void, CodegenError> emit_float_literal(const AST::FloatLiteralExpr& literal,
+                                                         const Semantic::SemanticType& type) {
+        try {
+            if (type.name == "float32") {
+                const float value = std::stof(literal.value);
+                const auto bits = std::bit_cast<std::uint32_t>(value);
+                emit_body_line("mov eax, " + format_u32_hex(bits));
+                return {};
+            }
+
+            const double value = std::stod(literal.value);
+            const auto bits = std::bit_cast<std::uint64_t>(value);
+            emit_body_line("mov rax, " + format_u64_hex(bits));
+            return {};
+        } catch (const std::exception&) {
+            return std::unexpected(
+                make_error(literal.range, "failed to lower floating-point literal"));
+        }
+    }
+
+    std::expected<void, CodegenError> emit_float_binary_expression(
+        const AST::BinaryExpr& binary, const Semantic::SemanticType& type) {
+        emit_body_line("mov rdi, rax");
+        emit_body_line("mov rsi, rcx");
+
+        switch (binary.op_type) {
+            case Lexer::TokenType::Plus:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_add");
+                return {};
+            case Lexer::TokenType::Minus:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_sub");
+                return {};
+            case Lexer::TokenType::Star:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_mul");
+                return {};
+            case Lexer::TokenType::Slash:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_div");
+                return {};
+            case Lexer::TokenType::Percent:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_mod");
+                return {};
+            case Lexer::TokenType::EqualEqual:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_eq");
+                return {};
+            case Lexer::TokenType::BangEqual:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_ne");
+                return {};
+            case Lexer::TokenType::Less:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_lt");
+                return {};
+            case Lexer::TokenType::LessEqual:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_le");
+                return {};
+            case Lexer::TokenType::Greater:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_gt");
+                return {};
+            case Lexer::TokenType::GreaterEqual:
+                emit_body_line("call __minic_rt_" + runtime_float_name(type) + "_ge");
+                return {};
+            default:
+                return std::unexpected(
+                    make_error(binary.range, "unsupported floating-point operator in stage 5"));
+        }
+    }
+
+    std::expected<void, CodegenError> emit_numeric_cast_expression(
+        const AST::Expr& operand, const Semantic::SemanticType& source_type,
+        const Semantic::SemanticType& target_type) {
+        auto emitted = emit_expression(operand);
+        if (!emitted) {
+            return std::unexpected(emitted.error());
+        }
+
+        if (source_type.name == target_type.name) {
+            return normalize_rax(target_type, operand.range);
+        }
+
+        if (is_integer_name(source_type.name) && is_integer_name(target_type.name)) {
+            return normalize_rax(target_type, operand.range);
+        }
+
+        emit_body_line("mov rdi, rax");
+
+        if (is_integer_name(source_type.name) && is_float_name(target_type.name)) {
+            emit_body_line("call __minic_rt_" + runtime_integer_name(source_type) + "_to_" +
+                           runtime_float_name(target_type));
+            return {};
+        }
+
+        if (is_float_name(source_type.name) && is_integer_name(target_type.name)) {
+            emit_body_line("call __minic_rt_" + runtime_float_name(source_type) + "_to_" +
+                           runtime_integer_name(target_type));
+            return normalize_rax(target_type, operand.range);
+        }
+
+        if (is_float_name(source_type.name) && is_float_name(target_type.name)) {
+            emit_body_line("call __minic_rt_" + runtime_float_name(source_type) + "_to_" +
+                           runtime_float_name(target_type));
+            return {};
+        }
+
+        return std::unexpected(make_error(
+            operand.range, "unsupported numeric cast at stage 5"));
+    }
+
+    std::expected<void, CodegenError> emit_string_cast_expression(
+        const AST::Expr& operand, const Semantic::SemanticType& source_type) {
+        auto emitted = emit_expression(operand);
+        if (!emitted) {
+            return std::unexpected(emitted.error());
+        }
+
+        emit_body_line("mov rdi, rax");
+        if (source_type.name == "bool") {
+            emit_body_line("call __minic_rt_bool_to_string");
+            return {};
+        }
+        if (is_integer_name(source_type.name)) {
+            emit_body_line("call __minic_rt_" + runtime_integer_name(source_type) + "_to_string");
+            return {};
+        }
+        if (is_float_name(source_type.name)) {
+            emit_body_line("call __minic_rt_" + runtime_float_name(source_type) + "_to_string");
+            return {};
+        }
+
+        return std::unexpected(make_error(
+            operand.range, "unsupported string cast at stage 5"));
+    }
+
     std::expected<Storage, CodegenError> lookup_storage(const std::string& name,
                                                         const Lexer::SourceRange& range) const {
         for (auto it = current_function_->scopes.rbegin(); it != current_function_->scopes.rend();
@@ -835,7 +1015,8 @@ class Generator {
 
     std::expected<void, CodegenError> normalize_rax(const Semantic::SemanticType& type,
                                                     const Lexer::SourceRange& range) {
-        if (type.name == "void" || type.name == "string" || type.name == "bool") {
+        if (type.name == "void" || type.name == "string" || type.name == "bool" ||
+            is_float_name(type.name)) {
             return {};
         }
 
