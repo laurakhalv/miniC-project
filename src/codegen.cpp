@@ -1,5 +1,4 @@
-#include "codogen.hpp"
-
+#include "codegen.hpp"
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -14,7 +13,7 @@ std::string mangle_name(std::string_view full_name) {
     return "__minic_fn_" + std::string(full_name);
 }
 
-}  // namespace
+}  
 
 namespace Codegen {
 
@@ -358,4 +357,4 @@ std::expected<std::string, CodegenError> generate_program(
     return generator.generate();
 }
 
-}
+} 

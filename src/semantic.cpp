@@ -12,12 +12,13 @@
 #include <utility>
 #include <vector>
 
+//объединяет части составного имени в одну строку через разделитель ::
 namespace {
 
 std::string join_path(const std::vector<std::string>& parts) {
-    std::string result;
+    std::string result; //создаём пустую строку
 
-    for (std::size_t i = 0; i < parts.size(); ++i) {
+    for (std::size_t i = 0; i < parts.size(); ++i) { //идём по всем элементам вектора
         if (i > 0) {
             result += "::";
         }
@@ -27,14 +28,15 @@ std::string join_path(const std::vector<std::string>& parts) {
     return result;
 }
 
+// объединяет два пути, добавляя второй в конец первого
 std::vector<std::string> append_path(const std::vector<std::string>& prefix,
                                      const std::vector<std::string>& suffix) {
-    std::vector<std::string> result = prefix;
-    result.insert(result.end(), suffix.begin(), suffix.end());
+    std::vector<std::string> result = prefix; //копируем первый путь
+    result.insert(result.end(), suffix.begin(), suffix.end()); //добавляем в конец все элементы из suffix
     return result;
 }
 
-bool is_builtin_type_name(std::string_view name) {
+bool is_builtin_type_name(std::string_view name) { //проверяет является ли тип встроенным
     return name == "int8" || name == "int16" || name == "int32" || name == "int64" ||
            name == "uint8" || name == "uint16" || name == "uint32" || name == "uint64" ||
            name == "float32" || name == "float64" || name == "bool" || name == "char" ||
@@ -42,38 +44,47 @@ bool is_builtin_type_name(std::string_view name) {
            name == "void";
 }
 
+//проверяет является ли выражение целым числом
 bool is_int_literal_expr(const AST::Expr& expr) {
     return dynamic_cast<const AST::IntLiteralExpr*>(&expr) != nullptr;
 }
 
+//проверка на float
 bool is_float_literal_expr(const AST::Expr& expr) {
     return dynamic_cast<const AST::FloatLiteralExpr*>(&expr) != nullptr;
 }
 
+// проверяет является ли выражение числом
 bool is_numeric_literal_expr(const AST::Expr& expr) {
     return is_int_literal_expr(expr) || is_float_literal_expr(expr);
 }
 
+//функция берет строку(текст) и превращает ее в число
 std::expected<std::size_t, std::string> parse_unsigned_integer_literal(std::string_view text) {
-    int base = 10;
+    int base = 10;//считаем, что число обычное (десятичное)
     std::size_t start = 0;
 
+    //Проверка может это hex?
     if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        //если есть 0x
         base = 16;
         start = 2;
+        //Проверка бинарное?
     } else if (text.size() > 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) {
         base = 2;
         start = 2;
     }
 
+    //Проверка ошибки
     if (start == text.size()) {
         return std::unexpected("missing digits");
     }
-
+//Читаем каждую букву
     std::size_t value = 0;
     for (std::size_t i = start; i < text.size(); ++i) {
         const char ch = text[i];
         int digit = -1;
+        //Превращаем символ в цифру
         if (ch >= '0' && ch <= '9') {
             digit = ch - '0';
         } else if (ch >= 'a' && ch <= 'f') {
@@ -86,13 +97,14 @@ std::expected<std::size_t, std::string> parse_unsigned_integer_literal(std::stri
             return std::unexpected("invalid digit");
         }
 
+        //Собираем число
         value = value * static_cast<std::size_t>(base) + static_cast<std::size_t>(digit);
     }
 
     return value;
 }
 
-}  // namespace
+}  
 
 namespace Semantic {
 
@@ -103,12 +115,13 @@ std::string format_error(const SemanticError& error) {
     return stream.str();
 }
 
+//это мозг компилятора
 class Analyzer {
   private:
     enum class TypeKind {
-        Builtin,
-        Array,
-        Struct,
+        Builtin, //int, bool
+        Array, //массив
+        Struct, //структура
     };
 
     struct Type;
@@ -116,6 +129,7 @@ class Analyzer {
 
     using TypePtr = std::shared_ptr<Type>;
 
+    //описывает типы данных и предоставляет методы для их классификации
     struct Type {
         TypeKind kind = TypeKind::Builtin;
         std::string name {};
@@ -144,6 +158,7 @@ class Analyzer {
         [[nodiscard]] bool is_numeric() const { return is_integer() || is_float(); }
     };
 
+    //виды встроенных функций
     enum class BuiltinKind {
         None,
         Print,
@@ -154,11 +169,13 @@ class Analyzer {
         Assert,
     };
 
+    //Описывает поле структуры
     struct FieldSymbol {
         std::string name {};
         TypePtr type {};
     };
 
+    //описание структуры
     struct StructSymbol {
         std::string full_name {};
         std::vector<std::string> namespace_path {};
@@ -166,18 +183,20 @@ class Analyzer {
         TypePtr type {};
         std::vector<FieldSymbol> fields;
         bool fields_resolved = false;
-        bool resolving = false;
+        bool resolving = false; //защита от рекурсии
     };
 
+    //тип alias (typedef)
     struct AliasSymbol {
         std::string full_name {};
         std::vector<std::string> namespace_path {};
         const AST::TypeAliasDecl* decl = nullptr;
-        TypePtr target_type {};
+        TypePtr target_type {}; //на что указывает alias
         bool resolved = false;
         bool resolving = false;
     };
 
+    //описание функции
     struct FunctionSymbol {
         std::string full_name {};
         std::vector<std::string> namespace_path {};
@@ -186,15 +205,16 @@ class Analyzer {
         TypePtr return_type {};
         bool signature_resolved = false;
         bool resolving = false;
-        bool is_builtin = false;
+        bool is_builtin = false; //встроенная или нет
         BuiltinKind builtin_kind = BuiltinKind::None;
     };
-
+// описание переменной её тип и изменяемость
     struct VariableSymbol {
         TypePtr type {};
         AST::Mutability mutability = AST::Mutability::Immutable;
     };
 
+    //результат анализа выражения тип, принадлежность функции и свойства lvalue
     struct ExprInfo {
         TypePtr type {};
         const FunctionSymbol* function = nullptr;
@@ -202,17 +222,22 @@ class Analyzer {
         bool is_mutable_lvalue = false;
     };
 
+
+    //выполняет полный семантический анализ программы 
   public:
-    explicit Analyzer(std::string filename) : filename_(std::move(filename)) { init_builtins(); }
+    explicit Analyzer(std::string filename) : filename_(std::move(filename)) { init_builtins(); } // добавляем int, float, print и тд
 
+    // главная функция семантического анализа
     std::expected<SemanticResult, SemanticError> analyze(const AST::Program& program) {
-        result_.program = &program;
+        result_.program = &program; // сохраняем AST программы
 
+        // 1. собираем все объявления (функции, структуры, alias)
         auto collected = collect_declarations(program.declarations, {});
         if (!collected) {
             return std::unexpected(collected.error());
         }
 
+        // 2. разрешаем alias (например: using A = int)
         for (auto& [_, alias] : aliases_) {
             auto resolved = resolve_alias(*alias);
             if (!resolved) {
@@ -220,6 +245,7 @@ class Analyzer {
             }
         }
 
+        // 3. разрешаем структуры (проверяем поля и типы)
         for (auto& [_, structure] : structs_) {
             auto resolved = resolve_struct_fields(*structure);
             if (!resolved) {
@@ -227,8 +253,9 @@ class Analyzer {
             }
         }
 
+        // 4. разрешаем сигнатуры функций (параметры и return)
         for (auto& [_, function] : functions_) {
-            if (function->is_builtin) {
+            if (function->is_builtin) { // пропускаем встроенные функции (print, input и тд)
                 continue;
             }
 
@@ -238,18 +265,23 @@ class Analyzer {
             }
         }
 
+         // 5. проверяем наличие функции main
         auto main_it = functions_.find("main");
         if (main_it == functions_.end() || main_it->second->is_builtin) {
+            // если main нет то ошибка
             return std::unexpected(make_error(Lexer::SourceLocation {},
                                               "function 'main' with signature 'func main() -> "
                                               "int32' is required"));
         }
 
+        // получаем main
         auto& main_function = *main_it->second;
+        // ещё раз проверяем сигнатуру main
         auto main_signature = resolve_function_signature(main_function);
         if (!main_signature) {
             return std::unexpected(main_signature.error());
         }
+        // 6. проверяем, что main: без параметров, возвращает int32
 
         if (!main_function.parameter_types.empty() ||
             !same_type(main_function.return_type, builtin_type("int32"))) {
@@ -258,7 +290,9 @@ class Analyzer {
                                               "'func main() -> int32'"));
         }
 
+         // 7. сбрасываем namespace перед анализом тел
         current_namespace_.clear();
+         // 8. анализируем тела функций (самый глубокий этап)
         auto analyzed = analyze_declaration_bodies(program.declarations);
         if (!analyzed) {
             return std::unexpected(analyzed.error());
@@ -270,20 +304,25 @@ class Analyzer {
   private:
     SemanticResult result_ {};
     std::string filename_;
-    std::vector<std::string> current_namespace_;
+    std::vector<std::string> current_namespace_;  // текущий namespace (например: std::vector)
+    
+    // стек областей видимости
+    // каждая map переменные в одной области
+    // vector вложенные блоки (if, функции и тд)
     std::vector<std::unordered_map<std::string, VariableSymbol>> local_scopes_;
     TypePtr current_return_type_ {};
     std::string current_function_name_ {};
-    int loop_depth_ = 0;
+    int loop_depth_ = 0; // глубина вложенности циклов (для break/continue)
 
-    std::unordered_map<std::string, TypePtr> builtin_types_;
-    std::unordered_map<std::string, TypePtr> array_types_;
-    std::unordered_set<std::string> namespaces_;
-    std::unordered_set<std::string> occupied_names_;
-    std::unordered_map<std::string, std::unique_ptr<StructSymbol>> structs_;
-    std::unordered_map<std::string, std::unique_ptr<AliasSymbol>> aliases_;
-    std::unordered_map<std::string, std::unique_ptr<FunctionSymbol>> functions_;
+    std::unordered_map<std::string, TypePtr> builtin_types_;  // встроенные типы: int32, float, bool
+    std::unordered_map<std::string, TypePtr> array_types_; // типы массивов
+    std::unordered_set<std::string> namespaces_;  // список namespace
+    std::unordered_set<std::string> occupied_names_; // занятые имена (чтобы не было дубликатов)
+    std::unordered_map<std::string, std::unique_ptr<StructSymbol>> structs_;  // все структуры в программе
+    std::unordered_map<std::string, std::unique_ptr<AliasSymbol>> aliases_;  // все alias (using)
+    std::unordered_map<std::string, std::unique_ptr<FunctionSymbol>> functions_;// все функции
 
+    //инициализация встроенных типов 
     void init_builtins() {
         register_builtin_type("int8");
         register_builtin_type("int16");
@@ -300,6 +339,7 @@ class Analyzer {
         register_builtin_type("string");
         register_builtin_type("void");
 
+         // добавляем встроенные функции
         register_builtin_function("print", BuiltinKind::Print, builtin_type("void"));
         register_builtin_function("input", BuiltinKind::Input, builtin_type("string"));
         register_builtin_function("len", BuiltinKind::Len, builtin_type("int32"));
@@ -308,6 +348,7 @@ class Analyzer {
         register_builtin_function("assert", BuiltinKind::Assert, builtin_type("void"));
     }
 
+    // добавление встроенного типа
     void register_builtin_type(std::string name) {
         const auto key = name;
         builtin_types_.emplace(key, std::make_shared<Type>(Type {
@@ -316,8 +357,9 @@ class Analyzer {
                                        }));
     }
 
+     // добавление встроенной функции
     void register_builtin_function(std::string name, BuiltinKind kind, TypePtr return_type) {
-        auto symbol = std::make_unique<FunctionSymbol>();
+        auto symbol = std::make_unique<FunctionSymbol>();  // создаём функцию
         symbol->full_name = name;
         symbol->return_type = std::move(return_type);
         symbol->signature_resolved = true;
@@ -327,14 +369,16 @@ class Analyzer {
         functions_.emplace(symbol->full_name, std::move(symbol));
     }
 
+    //ищет встроенный тип по имени
     TypePtr builtin_type(const std::string& name) const {
-        const auto it = builtin_types_.find(name);
-        if (it == builtin_types_.end()) {
+        const auto it = builtin_types_.find(name); //ищем тип
+        if (it == builtin_types_.end()) { //если не нашли → ошибка
             throw std::runtime_error("missing builtin type: " + name);
         }
         return it->second;
     }
 
+    // преобразует внутреннее представление типа в внешний формат для вывода
     SemanticType to_public_type(const TypePtr& type) const {
         SemanticType result;
 
@@ -366,6 +410,7 @@ class Analyzer {
         return result;
     }
 
+    //запоминает тип выражения
     void annotate_expr(const AST::Expr& expression, const TypePtr& type) {
         if (type != nullptr) {
             result_.expr_types[&expression] = to_public_type(type);
@@ -1768,4 +1813,4 @@ std::expected<SemanticResult, SemanticError> analyze_program(const AST::Program&
     return analyzer.analyze(program);
 }
 
-} 
+}
