@@ -1,5 +1,4 @@
 #include "codegen.hpp"
-
 #include <cctype>
 #include <sstream>
 #include <string>
@@ -12,6 +11,10 @@ namespace {
 bool is_integer_name(std::string_view name) {
     return name == "int8" || name == "int16" || name == "int32" || name == "int64" ||
            name == "uint8" || name == "uint16" || name == "uint32" || name == "uint64";
+}
+
+bool is_unsigned_integer_name(std::string_view name) {
+    return name == "uint8" || name == "uint16" || name == "uint32" || name == "uint64";
 }
 
 std::string mangle_name(std::string_view full_name) {
@@ -85,7 +88,7 @@ std::string escape_asm_string(std::string_view value) {
     return escaped;
 }
 
-}  // namespace
+} 
 
 namespace Codegen {
 
@@ -100,6 +103,11 @@ class Generator {
   private:
     static constexpr const char* kArgumentRegisters[6] = {"rdi", "rsi", "rdx",
                                                            "rcx", "r8",  "r9"};
+
+    struct FunctionInfo {
+        std::string full_name;
+        Semantic::SemanticType return_type {};
+    };
 
     struct Storage {
         int offset = 0;
@@ -122,6 +130,10 @@ class Generator {
           filename_(std::move(filename)) {
         for (const auto& [decl, info] : semantic_result_.functions) {
             function_names_.emplace(decl, info.full_name);
+            functions_by_name_.emplace(info.full_name, FunctionInfo {
+                                                           .full_name = info.full_name,
+                                                           .return_type = info.return_type,
+                                                       });
         }
     }
 
@@ -155,6 +167,7 @@ class Generator {
     int label_counter_ = 0;
     int string_counter_ = 0;
     std::unordered_map<const AST::FunctionDecl*, std::string> function_names_;
+    std::unordered_map<std::string, FunctionInfo> functions_by_name_;
     std::unordered_map<std::string, std::string> string_labels_;
     FunctionContext* current_function_ = nullptr;
 
@@ -281,10 +294,18 @@ class Generator {
         }
 
         if (const auto* declaration = dynamic_cast<const AST::VariableDeclStmt*>(&statement)) {
+            auto type = lookup_variable_type(*declaration);
+            if (!type) {
+                return std::unexpected(type.error());
+            }
             const int offset = allocate_stack_slot();
             auto emitted = emit_expression(*declaration->initializer);
             if (!emitted) {
                 return std::unexpected(emitted.error());
+            }
+            auto normalized = normalize_rax(*type, declaration->range);
+            if (!normalized) {
+                return std::unexpected(normalized.error());
             }
             emit_body_line("mov qword ptr [rbp - " + std::to_string(offset) + "], rax");
             current_function_->scopes.back().emplace(declaration->name, Storage {.offset = offset});
@@ -377,18 +398,23 @@ class Generator {
     }
 
     std::expected<void, CodegenError> emit_expression(const AST::Expr& expression) {
+        auto type = expression_type(expression);
+        if (!type) {
+            return std::unexpected(type.error());
+        }
+
         if (const auto* identifier = dynamic_cast<const AST::IdentifierExpr*>(&expression)) {
             auto storage = lookup_storage(identifier->name, expression.range);
             if (!storage) {
                 return std::unexpected(storage.error());
             }
             emit_body_line("mov rax, qword ptr [rbp - " + std::to_string(storage->offset) + "]");
-            return {};
+            return normalize_rax(*type, expression.range);
         }
 
         if (const auto* literal = dynamic_cast<const AST::IntLiteralExpr*>(&expression)) {
             emit_body_line("mov rax, " + literal->value);
-            return {};
+            return normalize_rax(*type, expression.range);
         }
 
         if (const auto* literal = dynamic_cast<const AST::BoolLiteralExpr*>(&expression)) {
@@ -426,6 +452,30 @@ class Generator {
 
         if (const auto* call = dynamic_cast<const AST::CallExpr*>(&expression)) {
             return emit_call_expression(*call);
+        }
+
+        if (const auto* assignment = dynamic_cast<const AST::AssignmentExpr*>(&expression)) {
+            const auto* identifier = dynamic_cast<const AST::IdentifierExpr*>(assignment->target.get());
+            if (identifier == nullptr) {
+                return std::unexpected(
+                    make_error(expression.range, "stage 4 supports only simple assignment targets"));
+            }
+
+            auto storage = lookup_storage(identifier->name, assignment->target->range);
+            if (!storage) {
+                return std::unexpected(storage.error());
+            }
+
+            auto emitted = emit_expression(*assignment->value);
+            if (!emitted) {
+                return std::unexpected(emitted.error());
+            }
+            auto normalized = normalize_rax(*type, assignment->value->range);
+            if (!normalized) {
+                return std::unexpected(normalized.error());
+            }
+            emit_body_line("mov qword ptr [rbp - " + std::to_string(storage->offset) + "], rax");
+            return {};
         }
 
         return std::unexpected(make_error(expression.range, "unsupported expression at stage 3"));
@@ -542,12 +592,38 @@ class Generator {
                 emit_body_line("imul rax, rcx");
                 return {};
             case Lexer::TokenType::Slash:
-                emit_body_line("cqo");
-                emit_body_line("idiv rcx");
+                {
+                    const auto non_zero = new_label(".Ldiv_ok");
+                    emit_body_line("cmp rcx, 0");
+                    emit_body_line("jne " + non_zero);
+                    emit_body_line("mov rdi, " + std::to_string(binary.right->range.begin.line));
+                    emit_body_line("call __minic_rt_div_zero");
+                    emit_body_label(non_zero);
+                    if (is_unsigned_integer_name(left_type->name)) {
+                        emit_body_line("xor edx, edx");
+                        emit_body_line("div rcx");
+                    } else {
+                        emit_body_line("cqo");
+                        emit_body_line("idiv rcx");
+                    }
+                }
                 return {};
             case Lexer::TokenType::Percent:
-                emit_body_line("cqo");
-                emit_body_line("idiv rcx");
+                {
+                    const auto non_zero = new_label(".Lmod_ok");
+                    emit_body_line("cmp rcx, 0");
+                    emit_body_line("jne " + non_zero);
+                    emit_body_line("mov rdi, " + std::to_string(binary.right->range.begin.line));
+                    emit_body_line("call __minic_rt_div_zero");
+                    emit_body_label(non_zero);
+                    if (is_unsigned_integer_name(left_type->name)) {
+                        emit_body_line("xor edx, edx");
+                        emit_body_line("div rcx");
+                    } else {
+                        emit_body_line("cqo");
+                        emit_body_line("idiv rcx");
+                    }
+                }
                 emit_body_line("mov rax, rdx");
                 return {};
             case Lexer::TokenType::EqualEqual:
@@ -562,22 +638,22 @@ class Generator {
                 return {};
             case Lexer::TokenType::Less:
                 emit_body_line("cmp rax, rcx");
-                emit_body_line("setl al");
+                emit_body_line(setcc_instruction(binary.op_type, left_type->name) + " al");
                 emit_body_line("movzx rax, al");
                 return {};
             case Lexer::TokenType::LessEqual:
                 emit_body_line("cmp rax, rcx");
-                emit_body_line("setle al");
+                emit_body_line(setcc_instruction(binary.op_type, left_type->name) + " al");
                 emit_body_line("movzx rax, al");
                 return {};
             case Lexer::TokenType::Greater:
                 emit_body_line("cmp rax, rcx");
-                emit_body_line("setg al");
+                emit_body_line(setcc_instruction(binary.op_type, left_type->name) + " al");
                 emit_body_line("movzx rax, al");
                 return {};
             case Lexer::TokenType::GreaterEqual:
                 emit_body_line("cmp rax, rcx");
-                emit_body_line("setge al");
+                emit_body_line(setcc_instruction(binary.op_type, left_type->name) + " al");
                 emit_body_line("movzx rax, al");
                 return {};
             default:
@@ -614,6 +690,12 @@ class Generator {
                 make_error(call.range, "codegen currently supports at most 6 call arguments"));
         }
 
+        const auto info_it = functions_by_name_.find(resolved->second);
+        if (info_it == functions_by_name_.end()) {
+            return std::unexpected(make_error(
+                call.range, "internal error: missing function info for '" + resolved->second + '\''));
+        }
+
         std::vector<int> argument_offsets;
         argument_offsets.reserve(call.arguments.size());
         for (std::size_t i = 0; i < call.arguments.size(); ++i) {
@@ -631,7 +713,7 @@ class Generator {
                            std::to_string(argument_offsets[i]) + "]");
         }
         emit_body_line("call " + mangle_name(resolved->second));
-        return {};
+        return normalize_rax(info_it->second.return_type, call.range);
     }
 
     std::expected<void, CodegenError> emit_builtin_print(const AST::CallExpr& call) {
@@ -655,7 +737,10 @@ class Generator {
         } else if (argument_type->name == "bool") {
             emit_body_line("call __minic_rt_print_bool");
         } else if (is_integer_name(argument_type->name)) {
-            emit_body_line("call __minic_rt_print_i64");
+            emit_body_line("call __minic_rt_" +
+                           std::string(is_unsigned_integer_name(argument_type->name)
+                                           ? "print_u64"
+                                           : "print_i64"));
         } else {
             return std::unexpected(make_error(
                 call.arguments[0]->range,
@@ -737,6 +822,62 @@ class Generator {
         }
         return it->second;
     }
+
+    std::expected<Semantic::SemanticType, CodegenError> lookup_variable_type(
+        const AST::VariableDeclStmt& declaration) const {
+        const auto it = semantic_result_.variables.find(&declaration);
+        if (it == semantic_result_.variables.end()) {
+            return std::unexpected(make_error(
+                declaration.range, "internal error: missing variable type annotation"));
+        }
+        return it->second.type;
+    }
+
+    std::expected<void, CodegenError> normalize_rax(const Semantic::SemanticType& type,
+                                                    const Lexer::SourceRange& range) {
+        if (type.name == "void" || type.name == "string" || type.name == "bool") {
+            return {};
+        }
+
+        if (!is_integer_name(type.name)) {
+            return std::unexpected(make_error(
+                range, "stage 4 scalar backend does not yet support this type"));
+        }
+
+        if (type.name == "int8") {
+            emit_body_line("movsx rax, al");
+        } else if (type.name == "uint8") {
+            emit_body_line("movzx eax, al");
+        } else if (type.name == "int16") {
+            emit_body_line("movsx rax, ax");
+        } else if (type.name == "uint16") {
+            emit_body_line("movzx eax, ax");
+        } else if (type.name == "int32") {
+            emit_body_line("movsxd rax, eax");
+        } else if (type.name == "uint32") {
+            emit_body_line("mov eax, eax");
+        }
+
+        return {};
+    }
+
+    [[nodiscard]] std::string setcc_instruction(Lexer::TokenType op_type,
+                                                std::string_view operand_type) const {
+        const bool is_unsigned = is_unsigned_integer_name(operand_type);
+
+        switch (op_type) {
+            case Lexer::TokenType::Less:
+                return is_unsigned ? "setb" : "setl";
+            case Lexer::TokenType::LessEqual:
+                return is_unsigned ? "setbe" : "setle";
+            case Lexer::TokenType::Greater:
+                return is_unsigned ? "seta" : "setg";
+            case Lexer::TokenType::GreaterEqual:
+                return is_unsigned ? "setae" : "setge";
+            default:
+                return "sete";
+        }
+    }
 };
 
 std::expected<std::string, CodegenError> generate_program(
@@ -746,4 +887,4 @@ std::expected<std::string, CodegenError> generate_program(
     return generator.generate();
 }
 
-}
+} 
