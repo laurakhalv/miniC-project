@@ -5,7 +5,7 @@
 
 namespace {
 
-// Небольшие helpers для единообразного форматирования дерева
+// Небольшие helpers для единообразного форматирования дерева.
 void write_indent(std::ostream& out, int indent) {
     for (int i = 0; i < indent; ++i) {
         out << "  ";
@@ -30,19 +30,31 @@ std::string join_name(const std::vector<std::string>& parts) {
     return result;
 }
 
-}  
+}  // namespace
 
 namespace AST {
 
 Node::Node(SourceRange source_range) : range(source_range) {}
 
+namespace {
+
+std::string visibility_to_string(Visibility visibility) {
+    return visibility == Visibility::Public ? "public" : "private";
+}
+
+}  // namespace
+
 void Parameter::dump(std::ostream& out, int indent) const {
     write_line(out, indent, "Parameter " + name);
     type->dump(out, indent + 1);
+    if (default_value) {
+        write_line(out, indent + 1, "Default");
+        default_value->dump(out, indent + 2);
+    }
 }
 
 void FieldDecl::dump(std::ostream& out, int indent) const {
-    write_line(out, indent, "Field " + name);
+    write_line(out, indent, "Field " + visibility_to_string(visibility) + " " + name);
     type->dump(out, indent + 1);
 }
 
@@ -53,7 +65,13 @@ void FieldInitializer::dump(std::ostream& out, int indent) const {
 
 void Program::dump(std::ostream& out) const {
     out << "Program\n";
-    // На верхнем уровне просто печатаем все объявления по порядку
+    if (module_name.has_value()) {
+        write_line(out, 1, "Module " + join_name(*module_name));
+    }
+    for (const auto& import : imports) {
+        write_line(out, 1, "Import " + join_name(import));
+    }
+    // На верхнем уровне просто печатаем все объявления по порядку.
     for (const auto& declaration : declarations) {
         declaration->dump(out, 1);
     }
@@ -74,16 +92,20 @@ void TypeSyntax::dump(std::ostream& out, int indent) const {
 FunctionDecl::FunctionDecl(SourceRange range, std::string function_name,
                            std::vector<Parameter> params,
                            std::unique_ptr<TypeSyntax> result_type,
-                           std::unique_ptr<BlockStmt> function_body)
+                           std::unique_ptr<BlockStmt> function_body, bool method,
+                           Visibility member_visibility)
     : Decl(range),
       name(std::move(function_name)),
       parameters(std::move(params)),
       return_type(std::move(result_type)),
-      body(std::move(function_body)) {}
+      body(std::move(function_body)),
+      is_method(method),
+      visibility(member_visibility) {}
 
 void FunctionDecl::dump(std::ostream& out, int indent) const {
-    write_line(out, indent, "FunctionDecl " + name);
-    // Параметры и return type выделяются отдельно, чтобы AST было легче читать глазами
+    const std::string prefix = is_method ? "MethodDecl " : "FunctionDecl ";
+    write_line(out, indent, prefix + visibility_to_string(visibility) + " " + name);
+    // Параметры и return type выделяются отдельно, чтобы AST было легче читать глазами.
     if (!parameters.empty()) {
         write_line(out, indent + 1, "Parameters");
         for (const auto& parameter : parameters) {
@@ -95,13 +117,20 @@ void FunctionDecl::dump(std::ostream& out, int indent) const {
     body->dump(out, indent + 1);
 }
 
-StructDecl::StructDecl(SourceRange range, std::string struct_name, std::vector<FieldDecl> field_list)
-    : Decl(range), name(std::move(struct_name)), fields(std::move(field_list)) {}
+StructDecl::StructDecl(SourceRange range, std::string struct_name, std::vector<FieldDecl> field_list,
+                       std::vector<std::unique_ptr<FunctionDecl>> method_list)
+    : Decl(range),
+      name(std::move(struct_name)),
+      fields(std::move(field_list)),
+      methods(std::move(method_list)) {}
 
 void StructDecl::dump(std::ostream& out, int indent) const {
     write_line(out, indent, "StructDecl " + name);
     for (const auto& field : fields) {
         field.dump(out, indent + 1);
+    }
+    for (const auto& method : methods) {
+        method->dump(out, indent + 1);
     }
 }
 
@@ -130,7 +159,7 @@ BlockStmt::BlockStmt(SourceRange range, std::vector<std::unique_ptr<Stmt>> body_
 
 void BlockStmt::dump(std::ostream& out, int indent) const {
     write_line(out, indent, "BlockStmt");
-    // Блок это просто список вложенных инструкций
+    // Блок - это просто список вложенных инструкций.
     for (const auto& statement : statements) {
         statement->dump(out, indent + 1);
     }
@@ -269,16 +298,25 @@ void CastExpr::dump(std::ostream& out, int indent) const {
 }
 
 CallExpr::CallExpr(SourceRange range, std::unique_ptr<Expr> target,
-                   std::vector<std::unique_ptr<Expr>> args)
+                   std::vector<CallArgument> args)
     : Expr(range), callee(std::move(target)), arguments(std::move(args)) {}
+
+void CallArgument::dump(std::ostream& out, int indent) const {
+    if (name.has_value()) {
+        write_line(out, indent, "NamedArgument " + *name);
+    } else {
+        write_line(out, indent, "Argument");
+    }
+    value->dump(out, indent + 1);
+}
 
 void CallExpr::dump(std::ostream& out, int indent) const {
     write_line(out, indent, "CallExpr");
     write_line(out, indent + 1, "Callee");
     callee->dump(out, indent + 2);
-    // Аргументы печатаются после callee в том порядке, в котором были в исходнике
+    // Аргументы печатаются после callee в том порядке, в котором были в исходнике.
     for (const auto& argument : arguments) {
-        argument->dump(out, indent + 1);
+        argument.dump(out, indent + 1);
     }
 }
 
@@ -348,6 +386,23 @@ BoolLiteralExpr::BoolLiteralExpr(SourceRange range, bool literal_value)
 
 void BoolLiteralExpr::dump(std::ostream& out, int indent) const {
     write_line(out, indent, std::string("BoolLiteralExpr ") + (value ? "true" : "false"));
+}
+
+IfExpr::IfExpr(SourceRange range, std::unique_ptr<Expr> if_condition,
+               std::unique_ptr<Expr> then_expr, std::unique_ptr<Expr> else_expr)
+    : Expr(range),
+      condition(std::move(if_condition)),
+      then_branch(std::move(then_expr)),
+      else_branch(std::move(else_expr)) {}
+
+void IfExpr::dump(std::ostream& out, int indent) const {
+    write_line(out, indent, "IfExpr");
+    write_line(out, indent + 1, "Condition");
+    condition->dump(out, indent + 2);
+    write_line(out, indent + 1, "Then");
+    then_branch->dump(out, indent + 2);
+    write_line(out, indent + 1, "Else");
+    else_branch->dump(out, indent + 2);
 }
 
 StructLiteralExpr::StructLiteralExpr(SourceRange range, std::vector<std::string> type_name,

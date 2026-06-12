@@ -20,7 +20,7 @@ struct Node {
 
     SourceRange range;
 
-    // dump() используется для --dump-ast и печатает дерево в читаемом виде
+    // dump() используется для --dump-ast и печатает дерево в читаемом виде.
     virtual void dump(std::ostream& out, int indent) const = 0;
 };
 
@@ -29,22 +29,27 @@ enum class Mutability {
     Immutable,
 };
 
+enum class Visibility {
+    Public,
+    Private,
+};
+
 struct Decl : Node {
     using Node::Node;
 };
 
-// Stmt - любой узел, который может стоять внутри блока как отдельная инструкция
+// Stmt - любой узел, который может стоять внутри блока как отдельная инструкция.
 struct Stmt : Node {
     using Node::Node;
 };
 
-// Expr -узел, который вычисляется в значение и может быть частью другого выражения
+// Expr - узел, который вычисляется в значение и может быть частью другого выражения.
 struct Expr : Node {
     using Node::Node;
 };
 
-// TypeSyntax хранит имя типа в том виде, как оно записано в программе
-// Например: int32, Point, Math::Point, int32[3]
+// TypeSyntax хранит имя типа в том виде, как оно записано в программе.
+// Например: int32, Point, Math::Point, int32[3].
 struct TypeSyntax final : Node {
     std::vector<std::string> name_parts;
     std::optional<std::string> array_size;
@@ -58,6 +63,7 @@ struct TypeSyntax final : Node {
 struct Parameter {
     std::unique_ptr<TypeSyntax> type;
     std::string name;
+    std::unique_ptr<Expr> default_value;
     SourceRange range {};
 
     void dump(std::ostream& out, int indent) const;
@@ -66,6 +72,7 @@ struct Parameter {
 struct FieldDecl {
     std::unique_ptr<TypeSyntax> type;
     std::string name;
+    Visibility visibility = Visibility::Public;
     SourceRange range {};
 
     void dump(std::ostream& out, int indent) const;
@@ -80,14 +87,16 @@ struct FieldInitializer {
 };
 
 struct Program {
-    // declarations -корневой список top-level объявлений модуля
+    // declarations - корневой список top-level объявлений модуля.
+    std::optional<std::vector<std::string>> module_name;
+    std::vector<std::vector<std::string>> imports;
     std::vector<std::unique_ptr<Decl>> declarations;
 
     void dump(std::ostream& out) const;
 };
 
 // BlockStmt вводит локальную область видимости и содержит последовательность
-// инструкций внутри фигурных скобок
+// инструкций внутри фигурных скобок.
 struct BlockStmt final : Stmt {
     std::vector<std::unique_ptr<Stmt>> statements;
 
@@ -101,11 +110,15 @@ struct FunctionDecl final : Decl {
     std::vector<Parameter> parameters;
     std::unique_ptr<TypeSyntax> return_type;
     std::unique_ptr<BlockStmt> body;
+    bool is_method = false;
+    Visibility visibility = Visibility::Public;
 
     FunctionDecl(SourceRange range, std::string function_name,
                  std::vector<Parameter> params,
                  std::unique_ptr<TypeSyntax> result_type,
-                 std::unique_ptr<BlockStmt> function_body);
+                 std::unique_ptr<BlockStmt> function_body,
+                 bool method = false,
+                 Visibility member_visibility = Visibility::Public);
 
     void dump(std::ostream& out, int indent) const override;
 };
@@ -113,8 +126,10 @@ struct FunctionDecl final : Decl {
 struct StructDecl final : Decl {
     std::string name;
     std::vector<FieldDecl> fields;
+    std::vector<std::unique_ptr<FunctionDecl>> methods;
 
-    StructDecl(SourceRange range, std::string struct_name, std::vector<FieldDecl> field_list);
+    StructDecl(SourceRange range, std::string struct_name, std::vector<FieldDecl> field_list,
+               std::vector<std::unique_ptr<FunctionDecl>> method_list);
 
     void dump(std::ostream& out, int indent) const override;
 };
@@ -209,7 +224,7 @@ struct EmptyStmt final : Stmt {
 };
 
 struct AssignmentExpr final : Expr {
-    // target - что присваиваем, value - что записываем
+    // target - что присваиваем, value - что записываем.
     std::unique_ptr<Expr> target;
     std::unique_ptr<Expr> value;
 
@@ -220,7 +235,7 @@ struct AssignmentExpr final : Expr {
 };
 
 struct BinaryExpr final : Expr {
-    // В BinaryExpr сохраняем и вид оператора, и его текстовую форму
+    // В BinaryExpr сохраняем и вид оператора, и его текстовую форму.
     TokenType op_type;
     std::string op_lexeme;
     std::unique_ptr<Expr> left;
@@ -253,12 +268,20 @@ struct CastExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+struct CallArgument {
+    std::optional<std::string> name;
+    std::unique_ptr<Expr> value;
+    SourceRange range {};
+
+    void dump(std::ostream& out, int indent) const;
+};
+
 struct CallExpr final : Expr {
     std::unique_ptr<Expr> callee;
-    std::vector<std::unique_ptr<Expr>> arguments;
+    std::vector<CallArgument> arguments;
 
     CallExpr(SourceRange range, std::unique_ptr<Expr> target,
-             std::vector<std::unique_ptr<Expr>> args);
+             std::vector<CallArgument> args);
 
     void dump(std::ostream& out, int indent) const override;
 };
@@ -284,7 +307,7 @@ struct FieldAccessExpr final : Expr {
 };
 
 struct IdentifierExpr final : Expr {
-    // Имя пока хранится как строка; смысл имени позже определяет semantic analysis
+    // Имя пока хранится как строка; смысл имени позже определяет semantic analysis.
     std::string name;
 
     IdentifierExpr(SourceRange range, std::string identifier_name);
@@ -340,8 +363,20 @@ struct BoolLiteralExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+struct IfExpr final : Expr {
+    std::unique_ptr<Expr> condition;
+    std::unique_ptr<Expr> then_branch;
+    std::unique_ptr<Expr> else_branch;
+
+    IfExpr(SourceRange range, std::unique_ptr<Expr> if_condition,
+           std::unique_ptr<Expr> then_expr,
+           std::unique_ptr<Expr> else_expr);
+
+    void dump(std::ostream& out, int indent) const override;
+};
+
 struct StructLiteralExpr final : Expr {
-    // type_path хранит путь к типу буквально так, как он был записан в программе
+    // type_path хранит путь к типу буквально так, как он был записан в программе.
     std::vector<std::string> type_path;
     std::vector<FieldInitializer> fields;
 
@@ -359,4 +394,4 @@ struct ArrayLiteralExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
-}  
+} 

@@ -35,6 +35,8 @@ enum class TokenType {
     Struct,
     Type,
     Namespace,
+    Module,
+    Import,
     If,
     Else,
     While,
@@ -42,8 +44,11 @@ enum class TokenType {
     Continue,
     Return,
     Cast,
+    Operator,
     True,
     False,
+    Public,
+    Private,
 
     Int8,
     Int16,
@@ -66,6 +71,9 @@ enum class TokenType {
     Star,
     Slash,
     Percent,
+    Amp,
+    Pipe,
+    Caret,
     Assign,
     EqualEqual,
     BangEqual,
@@ -73,9 +81,13 @@ enum class TokenType {
     Greater,
     LessEqual,
     GreaterEqual,
+    ShiftLeft,
+    ShiftRight,
     AmpAmp,
     PipePipe,
+    PipeGreater,
     Bang,
+    Tilde,
     LeftParen,
     RightParen,
     LeftBrace,
@@ -107,4 +119,4 @@ struct LexError {
 std::string_view to_string(TokenType type);
 std::string format_error(const LexError& error);
 
-} 
+}

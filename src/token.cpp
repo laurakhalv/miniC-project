@@ -31,6 +31,10 @@ std::string_view to_string(TokenType type) {
             return "Type";
         case TokenType::Namespace:
             return "Namespace";
+        case TokenType::Module:
+            return "Module";
+        case TokenType::Import:
+            return "Import";
         case TokenType::If:
             return "If";
         case TokenType::Else:
@@ -45,10 +49,16 @@ std::string_view to_string(TokenType type) {
             return "Return";
         case TokenType::Cast:
             return "Cast";
+        case TokenType::Operator:
+            return "Operator";
         case TokenType::True:
             return "True";
         case TokenType::False:
             return "False";
+        case TokenType::Public:
+            return "Public";
+        case TokenType::Private:
+            return "Private";
         case TokenType::Int8:
             return "Int8";
         case TokenType::Int16:
@@ -87,6 +97,12 @@ std::string_view to_string(TokenType type) {
             return "Slash";
         case TokenType::Percent:
             return "Percent";
+        case TokenType::Amp:
+            return "Amp";
+        case TokenType::Pipe:
+            return "Pipe";
+        case TokenType::Caret:
+            return "Caret";
         case TokenType::Assign:
             return "Assign";
         case TokenType::EqualEqual:
@@ -101,12 +117,20 @@ std::string_view to_string(TokenType type) {
             return "LessEqual";
         case TokenType::GreaterEqual:
             return "GreaterEqual";
+        case TokenType::ShiftLeft:
+            return "ShiftLeft";
+        case TokenType::ShiftRight:
+            return "ShiftRight";
         case TokenType::AmpAmp:
             return "AmpAmp";
         case TokenType::PipePipe:
             return "PipePipe";
+        case TokenType::PipeGreater:
+            return "PipeGreater";
         case TokenType::Bang:
             return "Bang";
+        case TokenType::Tilde:
+            return "Tilde";
         case TokenType::LeftParen:
             return "LeftParen";
         case TokenType::RightParen:
@@ -144,4 +168,4 @@ std::string format_error(const LexError& error) {
     return stream.str();
 }
 
-}   
+} 
