@@ -5,13 +5,86 @@
 
 namespace {
 
-// Для составных узлов удобно брать диапазон от начала левой части
-// до конца правой, чтобы AST-узел покрывал весь исходный фрагмент
+// объединяет два диапазона позиций в один , берёт начало левого и конец правого
 Lexer::SourceRange combine_ranges(Lexer::SourceRange left, Lexer::SourceRange right) {
     return Lexer::SourceRange {.begin = left.begin, .end = right.end};
 }
 
-}  
+//(доп A.2.9) переводит тип токена оператора в внутреннее имя функции-оператора
+std::optional<std::string> operator_function_name(Lexer::TokenType type) {
+    using TokenType = Lexer::TokenType;
+    switch (type) {
+        case TokenType::Plus:
+            return "operator+";
+        case TokenType::Minus:
+            return "operator-";
+        case TokenType::Star:
+            return "operator*";
+        case TokenType::Slash:
+            return "operator/";
+        case TokenType::Percent:
+            return "operator%";
+        case TokenType::EqualEqual:
+            return "operator==";
+        case TokenType::BangEqual:
+            return "operator!=";
+        case TokenType::Less:
+            return "operator<";
+        case TokenType::Greater:
+            return "operator>";
+        case TokenType::LessEqual:
+            return "operator<=";
+        case TokenType::GreaterEqual:
+            return "operator>=";
+        case TokenType::Amp:
+            return "operator&";
+        case TokenType::Pipe:
+            return "operator|";
+        case TokenType::Caret:
+            return "operator^";
+        case TokenType::Tilde:
+            return "operator~";
+        case TokenType::Bang:
+            return "operator!";
+        case TokenType::ShiftLeft:
+            return "operator<<";
+        case TokenType::ShiftRight:
+            return "operator>>";
+        default:
+            return std::nullopt;
+    }
+}
+
+//реализует конвейерный оператор |> (доп A.1.9)
+std::unique_ptr<AST::Expr> lower_pipe_expression(std::unique_ptr<AST::Expr> left,
+                                                 std::unique_ptr<AST::Expr> right,
+                                                 Lexer::SourceRange range) {
+    if (auto* call = dynamic_cast<AST::CallExpr*>(right.get())) {
+        std::vector<AST::CallArgument> arguments;
+        arguments.push_back(AST::CallArgument {
+            .name = std::nullopt,
+            .value = std::move(left),
+            .range = range,
+        });
+        for (auto& argument : call->arguments) {
+            arguments.push_back(std::move(argument));
+        }
+
+        return std::unique_ptr<AST::Expr>(std::make_unique<AST::CallExpr>(
+            range, std::move(call->callee), std::move(arguments)));
+    }
+
+    std::vector<AST::CallArgument> arguments;
+    arguments.push_back(AST::CallArgument {
+        .name = std::nullopt,
+        .value = std::move(left),
+        .range = range,
+    });
+    return std::unique_ptr<AST::Expr>(
+        std::make_unique<AST::CallExpr>(range, std::move(right), std::move(arguments)));
+}
+
+} 
 
 namespace Parser {
 
@@ -22,16 +95,58 @@ std::string format_error(const ParseError& error) {
     return stream.str();
 }
 
+//принимает уже готовый список токенов от лексера
 Parser::Parser(std::vector<Lexer::Token> tokens, std::string filename)
     : tokens_(std::move(tokens)), filename_(std::move(filename)) {}
 
+    //точка входа парсера. разбирает весь файл
 std::expected<AST::Program, ParseError> Parser::parse_program() {
     AST::Program program;
 
-    // На верхнем уровне grammar допускает только декларации, поэтому
-    // программа разбирается как последовательность Decl до EOF
+    if (match(TokenType::Module)) {
+        auto module_path = parse_module_path();
+        if (!module_path) {
+            return std::unexpected(module_path.error());
+        }
+        auto semicolon = consume(TokenType::Semicolon, "expected ';' after module declaration");
+        if (!semicolon) {
+            return std::unexpected(semicolon.error());
+        }
+        program.module_name = std::move(module_path->parts);
+    }
+
+    const bool default_exported = program.module_name.has_value();
+
+   while (match(TokenType::Import)) {
+        const auto import_token = previous();
+        auto module_path = parse_module_path();
+        if (!module_path) {
+            return std::unexpected(module_path.error());
+        }
+
+        std::optional<std::vector<std::string>> imported_path;
+        if (match(TokenType::ColonColon)) {
+            auto path = parse_identifier_path();
+            if (!path) {
+                return std::unexpected(path.error());
+            }
+            imported_path = std::move(path->parts);
+        }
+
+        auto semicolon = consume(TokenType::Semicolon, "expected ';' after import declaration");
+        if (!semicolon) {
+            return std::unexpected(semicolon.error());
+        }
+
+        program.imports.push_back(AST::ImportSpec {
+            .module_path = std::move(module_path->parts),
+            .imported_path = std::move(imported_path),
+            .range = combine_ranges(import_token.range, semicolon->range),
+        });
+    }
+
     while (!is_at_end()) {
-        auto declaration_or_error = parse_declaration();
+        auto declaration_or_error = parse_declaration(default_exported);
         if (!declaration_or_error) {
             return std::unexpected(declaration_or_error.error());
         }
@@ -42,18 +157,20 @@ std::expected<AST::Program, ParseError> Parser::parse_program() {
     return program;
 }
 
+
 bool Parser::is_at_end() const {
     return peek().type == TokenType::EndOfFile;
 }
-
+//возвращает текущий токен без продвижения
 const Parser::Token& Parser::peek() const {
     return tokens_[current_];
 }
 
+//возвращает предыдущий уже прочитанный токен
 const Parser::Token& Parser::previous() const {
     return tokens_[current_ - 1];
 }
-
+//возвращает токен, который был только что прочитан
 const Parser::Token& Parser::advance() {
     if (!is_at_end()) {
         ++current_;
@@ -61,6 +178,7 @@ const Parser::Token& Parser::advance() {
     return previous();
 }
 
+//проверяет тип текущего токена
 bool Parser::check(TokenType type) const {
     if (is_at_end()) {
         return type == TokenType::EndOfFile;
@@ -68,8 +186,16 @@ bool Parser::check(TokenType type) const {
     return peek().type == type;
 }
 
+//какой тип у следующего токена
+bool Parser::check_next(TokenType type) const {
+    if (current_ + 1 >= tokens_.size()) {
+        return type == TokenType::EndOfFile;
+    }
+    return tokens_[current_ + 1].type == type;
+}
+
 bool Parser::match(TokenType type) {
-    // match() одновременно проверяет токен и продвигает parser вперёд
+    //одновременно проверяет токен и продвигает parser вперёд
     if (!check(type)) {
         return false;
     }
@@ -88,13 +214,14 @@ bool Parser::match_any(std::initializer_list<TokenType> types) {
     return false;
 }
 
+//используется для обязательных частей grammar
 std::expected<Parser::Token, ParseError> Parser::consume(TokenType type, std::string message) {
     if (check(type)) {
         return advance();
     }
     return std::unexpected(make_error(peek(), std::move(message)));
 }
-
+// собирает объект ошибки
 ParseError Parser::make_error(const Token& token, std::string message) const {
     return ParseError {
         .filename = filename_,
@@ -103,14 +230,28 @@ ParseError Parser::make_error(const Token& token, std::string message) const {
     };
 }
 
-std::expected<std::unique_ptr<AST::Decl>, ParseError> Parser::parse_declaration() {
+// разбирает одну верхнеуровневую декларацию
+std::expected<std::unique_ptr<AST::Decl>, ParseError> Parser::parse_declaration(
+    bool default_exported) {
     // Верхний уровень dispatch: смотрим на первый токен и понимаем,
-    //какой именно Decl должен идти дальше
+    // какой именно Decl должен идти дальше.
+    bool is_exported = default_exported;
+    bool saw_visibility_modifier = false;
+    if (match(TokenType::Export)) {
+        is_exported = true;
+        saw_visibility_modifier = true;
+    } else if (match(TokenType::Private)) {
+        is_exported = false;
+        saw_visibility_modifier = true;
+    }
+
     if (check(TokenType::Func)) {
         auto decl = parse_function_decl();
         if (!decl) {
             return std::unexpected(decl.error());
         }
+        decl.value()->is_exported = is_exported;
+        decl.value()->has_module_visibility = saw_visibility_modifier || default_exported;
         return std::unique_ptr<AST::Decl>(std::move(decl.value()));
     }
 
@@ -119,6 +260,8 @@ std::expected<std::unique_ptr<AST::Decl>, ParseError> Parser::parse_declaration(
         if (!decl) {
             return std::unexpected(decl.error());
         }
+        decl.value()->is_exported = is_exported;
+        decl.value()->has_module_visibility = saw_visibility_modifier || default_exported;
         return std::unique_ptr<AST::Decl>(std::move(decl.value()));
     }
 
@@ -127,29 +270,53 @@ std::expected<std::unique_ptr<AST::Decl>, ParseError> Parser::parse_declaration(
         if (!decl) {
             return std::unexpected(decl.error());
         }
+        decl.value()->is_exported = is_exported;
+        decl.value()->has_module_visibility = saw_visibility_modifier || default_exported;
         return std::unique_ptr<AST::Decl>(std::move(decl.value()));
     }
 
     if (check(TokenType::Namespace)) {
-        auto decl = parse_namespace_decl();
+        auto decl = parse_namespace_decl(default_exported);
         if (!decl) {
             return std::unexpected(decl.error());
         }
+        decl.value()->is_exported = is_exported;
+        decl.value()->has_module_visibility = saw_visibility_modifier || default_exported;
         return std::unique_ptr<AST::Decl>(std::move(decl.value()));
+    }
+
+    if (saw_visibility_modifier) {
+        return std::unexpected(
+            make_error(peek(), "expected declaration after module visibility modifier"));
     }
 
     return std::unexpected(make_error(peek(), "expected top-level declaration"));
 }
 
-std::expected<std::unique_ptr<AST::FunctionDecl>, ParseError> Parser::parse_function_decl() {
+//читает объявление функции по шагам
+std::expected<std::unique_ptr<AST::FunctionDecl>, ParseError> Parser::parse_function_decl(
+    bool is_method, AST::Visibility visibility) {
     auto func_token = consume(TokenType::Func, "expected 'func'");
     if (!func_token) {
         return std::unexpected(func_token.error());
     }
 
-    auto name_token = consume(TokenType::Identifier, "expected function name");
-    if (!name_token) {
-        return std::unexpected(name_token.error());
+    std::string function_name;
+    if (match(TokenType::Operator)) {
+        const auto operator_token = peek();
+        const auto parsed_name = operator_function_name(operator_token.type);
+        if (!parsed_name.has_value()) {
+            return std::unexpected(
+                make_error(operator_token, "expected overloadable operator after 'operator'"));
+        }
+        advance();
+        function_name = *parsed_name;
+    } else {
+        auto name_token = consume(TokenType::Identifier, "expected function name");
+        if (!name_token) {
+            return std::unexpected(name_token.error());
+        }
+        function_name = name_token->lexeme;
     }
 
     auto left_paren = consume(TokenType::LeftParen, "expected '(' after function name");
@@ -157,8 +324,8 @@ std::expected<std::unique_ptr<AST::FunctionDecl>, ParseError> Parser::parse_func
         return std::unexpected(left_paren.error());
     }
 
+    //разбирает параметры, return type и body функции, а потом создаёт FunctionDecl
     std::vector<AST::Parameter> parameters;
-    // Параметры читаются как повторяющаяся последовательность "Type name"
     if (!check(TokenType::RightParen)) {
         while (true) {
             auto parameter_type = parse_type();
@@ -174,8 +341,16 @@ std::expected<std::unique_ptr<AST::FunctionDecl>, ParseError> Parser::parse_func
             AST::Parameter parameter {
                 .type = std::move(parameter_type.value()),
                 .name = parameter_name->lexeme,
+                .default_value = nullptr,
                 .range = {},
             };
+            if (match(TokenType::Assign)) {
+                auto default_value = parse_expression();
+                if (!default_value) {
+                    return std::unexpected(default_value.error());
+                }
+                parameter.default_value = std::move(default_value.value());
+            }
             parameter.range = combine_ranges(parameter.type->range, parameter_name->range);
             parameters.push_back(std::move(parameter));
 
@@ -207,10 +382,13 @@ std::expected<std::unique_ptr<AST::FunctionDecl>, ParseError> Parser::parse_func
 
     const auto range = combine_ranges(func_token->range, body.value()->range);
     return std::make_unique<AST::FunctionDecl>(
-        range, name_token->lexeme, std::move(parameters), std::move(return_type.value()),
-        std::move(body.value()));
+        range, function_name, std::move(parameters), std::move(return_type.value()),
+        std::move(body.value()), is_method, visibility);
 }
 
+//реализация (доп A.2.3) методы и (A.2.4) видимость
+
+// разбирает начало структуры struct, имя и {
 std::expected<std::unique_ptr<AST::StructDecl>, ParseError> Parser::parse_struct_decl() {
     auto struct_token = consume(TokenType::Struct, "expected 'struct'");
     if (!struct_token) {
@@ -228,30 +406,48 @@ std::expected<std::unique_ptr<AST::StructDecl>, ParseError> Parser::parse_struct
     }
 
     std::vector<AST::FieldDecl> fields;
-    if (!check(TokenType::RightBrace)) {
-        while (true) {
-            auto field_type = parse_type();
-            if (!field_type) {
-                return std::unexpected(field_type.error());
-            }
+    std::vector<std::unique_ptr<AST::FunctionDecl>> methods;
+    AST::Visibility current_visibility = AST::Visibility::Public;
 
-            auto field_name = consume(TokenType::Identifier, "expected field name");
-            if (!field_name) {
-                return std::unexpected(field_name.error());
-            }
-
-            AST::FieldDecl field {
-                .type = std::move(field_type.value()),
-                .name = field_name->lexeme,
-                .range = {},
-            };
-            field.range = combine_ranges(field.type->range, field_name->range);
-            fields.push_back(std::move(field));
-
-            if (!match(TokenType::Comma)) {
-                break;
-            }
+    while (!check(TokenType::RightBrace) && !is_at_end()) {
+        if ((check(TokenType::Public) || check(TokenType::Private)) && check_next(TokenType::Colon)) {
+            current_visibility = check(TokenType::Public) ? AST::Visibility::Public
+                                                          : AST::Visibility::Private;
+            advance();
+            advance();
+            continue;
         }
+
+        //разбор методов структуры
+        if (check(TokenType::Func)) {
+            auto method = parse_function_decl(true, current_visibility);
+            if (!method) {
+                return std::unexpected(method.error());
+            }
+            methods.push_back(std::move(method.value()));
+            continue;
+        }
+
+        auto field_type = parse_type();
+        if (!field_type) {
+            return std::unexpected(field_type.error());
+        }
+
+        auto field_name = consume(TokenType::Identifier, "expected field name");
+        if (!field_name) {
+            return std::unexpected(field_name.error());
+        }
+
+        AST::FieldDecl field {
+            .type = std::move(field_type.value()),
+            .name = field_name->lexeme,
+            .visibility = current_visibility,
+            .range = {},
+        };
+        field.range = combine_ranges(field.type->range, field_name->range);
+        fields.push_back(std::move(field));
+
+        match(TokenType::Comma);
     }
 
     auto right_brace = consume(TokenType::RightBrace, "expected '}' after struct body");
@@ -260,9 +456,11 @@ std::expected<std::unique_ptr<AST::StructDecl>, ParseError> Parser::parse_struct
     }
 
     const auto range = combine_ranges(struct_token->range, right_brace->range);
-    return std::make_unique<AST::StructDecl>(range, name_token->lexeme, std::move(fields));
+    return std::make_unique<AST::StructDecl>(range, name_token->lexeme, std::move(fields),
+                                             std::move(methods));
 }
 
+//разбирает type alias
 std::expected<std::unique_ptr<AST::TypeAliasDecl>, ParseError> Parser::parse_type_alias_decl() {
     auto type_token = consume(TokenType::Type, "expected 'type'");
     if (!type_token) {
@@ -294,7 +492,9 @@ std::expected<std::unique_ptr<AST::TypeAliasDecl>, ParseError> Parser::parse_typ
         range, name_token->lexeme, std::move(target_type.value()));
 }
 
-std::expected<std::unique_ptr<AST::NamespaceDecl>, ParseError> Parser::parse_namespace_decl() {
+//разбирает namespace
+std::expected<std::unique_ptr<AST::NamespaceDecl>, ParseError> Parser::parse_namespace_decl(
+    bool default_exported) {
     auto namespace_token = consume(TokenType::Namespace, "expected 'namespace'");
     if (!namespace_token) {
         return std::unexpected(namespace_token.error());
@@ -312,7 +512,7 @@ std::expected<std::unique_ptr<AST::NamespaceDecl>, ParseError> Parser::parse_nam
 
     std::vector<std::unique_ptr<AST::Decl>> declarations;
     while (!check(TokenType::RightBrace) && !is_at_end()) {
-        auto declaration_or_error = parse_declaration();
+        auto declaration_or_error = parse_declaration(default_exported);
         if (!declaration_or_error) {
             return std::unexpected(declaration_or_error.error());
         }
@@ -329,12 +529,13 @@ std::expected<std::unique_ptr<AST::NamespaceDecl>, ParseError> Parser::parse_nam
         range, name_token->lexeme, std::move(declarations));
 }
 
+//читает тип в любой форме
 std::expected<std::unique_ptr<AST::TypeSyntax>, ParseError> Parser::parse_type() {
     std::vector<std::string> parts;
     Lexer::SourceRange range {};
 
-    // Тип может быть либо встроенным (int32, bool, ...), либо пользовательским
-    //именем/квалифицированным именем вроде Math::Point
+    // встроенный тип (int32, bool, итд), пользовательским
+    // именем/квалифицированным именем вроде Math::Point и массив
     if (is_builtin_type_token(peek().type)) {
         const auto token = advance();
         parts.push_back(token.lexeme);
@@ -369,6 +570,7 @@ std::expected<std::unique_ptr<AST::TypeSyntax>, ParseError> Parser::parse_type()
     return std::make_unique<AST::TypeSyntax>(range, std::move(parts), std::move(array_size));
 }
 
+//читает квалифицированное имя A::B::C
 std::expected<Parser::ParsedPath, ParseError> Parser::parse_identifier_path() {
     auto first = consume(TokenType::Identifier, "expected identifier");
     if (!first) {
@@ -381,7 +583,7 @@ std::expected<Parser::ParsedPath, ParseError> Parser::parse_identifier_path() {
     };
 
     while (match(TokenType::ColonColon)) {
-        // Если встретили '::', значит читаем следующую часть квалифицированного имени.
+        // если встретили ::, значит читаем следующую часть квалифицированного имени
         auto part = consume(TokenType::Identifier, "expected identifier after '::'");
         if (!part) {
             return std::unexpected(part.error());
@@ -394,6 +596,32 @@ std::expected<Parser::ParsedPath, ParseError> Parser::parse_identifier_path() {
     return path;
 }
 
+//разбирает последовательность идентификаторов через точку .
+std::expected<Parser::ParsedPath, ParseError> Parser::parse_module_path() {
+    auto first = consume(TokenType::Identifier, "expected module name");
+    if (!first) {
+        return std::unexpected(first.error());
+    }
+
+    ParsedPath path {
+        .parts = {first->lexeme},
+        .range = first->range,
+    };
+
+    while (match(TokenType::Dot)) {
+        auto part = consume(TokenType::Identifier, "expected module name after '.'");
+        if (!part) {
+            return std::unexpected(part.error());
+        }
+
+        path.parts.push_back(part->lexeme);
+        path.range = combine_ranges(path.range, part->range);
+    }
+
+    return path;
+}
+
+//читает { инструкции }
 std::expected<std::unique_ptr<AST::BlockStmt>, ParseError> Parser::parse_block() {
     auto left_brace = consume(TokenType::LeftBrace, "expected '{'");
     if (!left_brace) {
@@ -419,7 +647,7 @@ std::expected<std::unique_ptr<AST::BlockStmt>, ParseError> Parser::parse_block()
 }
 
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_statement() {
-    // Порядок проверок отражает grammar: сначала конструкции с явным первым токеном, а если ничего не подошло, остаётся expression statement
+    // по первому токену выбирает, какую инструкцию parser должен сейчас разобрать
     if (check(TokenType::LeftBrace)) {
         auto block = parse_block();
         if (!block) {
@@ -456,7 +684,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_statement() 
         return parse_empty_statement();
     }
 
-    return parse_expression_statement();
+    return parse_expression_statement(); //если ничего не подошло expression statement
 }
 
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_variable_decl_statement() {
@@ -464,7 +692,6 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_variable_dec
     const auto mutability = keyword.type == TokenType::Let ? AST::Mutability::Mutable
                                                            : AST::Mutability::Immutable;
 
-    // В grammar объявление локальной переменной имеет вид:
     // let/const Type name = expression ;
     auto type = parse_type();
     if (!type) {
@@ -497,6 +724,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_variable_dec
         std::move(initializer.value())));
 }
 
+// if (cond) { } else { }
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_if_statement() {
     auto if_token = consume(TokenType::If, "expected 'if'");
     if (!if_token) {
@@ -539,6 +767,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_if_statement
         std::move(else_branch)));
 }
 
+//while (...) {..}
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_while_statement() {
     auto while_token = consume(TokenType::While, "expected 'while'");
     if (!while_token) {
@@ -570,6 +799,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_while_statem
         range, std::move(condition.value()), std::move(body.value())));
 }
 
+//return expr; return;
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_return_statement() {
     auto return_token = consume(TokenType::Return, "expected 'return'");
     if (!return_token) {
@@ -595,6 +825,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_return_state
         std::make_unique<AST::ReturnStmt>(range, std::move(value)));
 }
 
+//break
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_break_statement() {
     auto break_token = consume(TokenType::Break, "expected 'break'");
     if (!break_token) {
@@ -610,6 +841,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_break_statem
         std::make_unique<AST::BreakStmt>(combine_ranges(break_token->range, semicolon->range)));
 }
 
+//continue
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_continue_statement() {
     auto continue_token = consume(TokenType::Continue, "expected 'continue'");
     if (!continue_token) {
@@ -625,6 +857,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_continue_sta
         combine_ranges(continue_token->range, semicolon->range)));
 }
 
+//просто выражение с ; (print("hello");)
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_expression_statement() {
     auto expression = parse_expression();
     if (!expression) {
@@ -641,6 +874,7 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_expression_s
         std::make_unique<AST::ExprStmt>(range, std::move(expression.value())));
 }
 
+// ;
 std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_empty_statement() {
     auto semicolon = consume(TokenType::Semicolon, "expected ';'");
     if (!semicolon) {
@@ -650,18 +884,19 @@ std::expected<std::unique_ptr<AST::Stmt>, ParseError> Parser::parse_empty_statem
     return std::unique_ptr<AST::Stmt>(std::make_unique<AST::EmptyStmt>(semicolon->range));
 }
 
+//верхняя точка входа для разбора выражений
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_expression() {
-    // parse_expression() просто делегирует в верхний уровень приоритетов
     return parse_assignment_expression();
 }
 
+//присваивание 
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_assignment_expression() {
-    auto left = parse_logical_or_expression();
+    auto left = parse_pipe_expression();
     if (!left) {
         return std::unexpected(left.error());
     }
 
-    //Присваивание правоассоциативно, поэтому правую часть снова разбираем через parse_assignment_expression()
+    // присваивание правоассоциативно
     if (!match(TokenType::Assign)) {
         return left;
     }
@@ -681,6 +916,28 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_assignment_e
         range, std::move(left.value()), std::move(right.value())));
 }
 
+// x |> f (доп A.1.9)
+std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_pipe_expression() {
+    auto expression = parse_logical_or_expression();
+    if (!expression) {
+        return std::unexpected(expression.error());
+    }
+
+    while (match(TokenType::PipeGreater)) {
+        auto right = parse_logical_or_expression();
+        if (!right) {
+            return std::unexpected(right.error());
+        }
+
+        const auto range = combine_ranges(expression.value()->range, right.value()->range);
+        expression = lower_pipe_expression(std::move(expression.value()),
+                                           std::move(right.value()), range);
+    }
+
+    return expression;
+}
+
+// ||
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_logical_or_expression() {
     auto expression = parse_logical_and_expression();
     if (!expression) {
@@ -700,15 +957,80 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_logical_or_e
     }
 
     return expression;
-}
-
+}//&&
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_logical_and_expression() {
-    auto expression = parse_equality_expression();
+    auto expression = parse_bitwise_or_expression();
     if (!expression) {
         return std::unexpected(expression.error());
     }
 
     while (match(TokenType::AmpAmp)) {
+        const auto op = previous();
+        auto right = parse_bitwise_or_expression();
+        if (!right) {
+            return std::unexpected(right.error());
+        }
+
+        const auto range = combine_ranges(expression.value()->range, right.value()->range);
+        expression = std::unique_ptr<AST::Expr>(std::make_unique<AST::BinaryExpr>(
+            range, op.type, op.lexeme, std::move(expression.value()), std::move(right.value())));
+    }
+
+    return expression;
+}
+
+//|
+std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_bitwise_or_expression() {
+    auto expression = parse_bitwise_xor_expression();
+    if (!expression) {
+        return std::unexpected(expression.error());
+    }
+
+    while (match(TokenType::Pipe)) {
+        const auto op = previous();
+        auto right = parse_bitwise_xor_expression();
+        if (!right) {
+            return std::unexpected(right.error());
+        }
+
+        const auto range = combine_ranges(expression.value()->range, right.value()->range);
+        expression = std::unique_ptr<AST::Expr>(std::make_unique<AST::BinaryExpr>(
+            range, op.type, op.lexeme, std::move(expression.value()), std::move(right.value())));
+    }
+
+    return expression;
+}
+
+//^
+std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_bitwise_xor_expression() {
+    auto expression = parse_bitwise_and_expression();
+    if (!expression) {
+        return std::unexpected(expression.error());
+    }
+
+    while (match(TokenType::Caret)) {
+        const auto op = previous();
+        auto right = parse_bitwise_and_expression();
+        if (!right) {
+            return std::unexpected(right.error());
+        }
+
+        const auto range = combine_ranges(expression.value()->range, right.value()->range);
+        expression = std::unique_ptr<AST::Expr>(std::make_unique<AST::BinaryExpr>(
+            range, op.type, op.lexeme, std::move(expression.value()), std::move(right.value())));
+    }
+
+    return expression;
+}
+
+//&
+std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_bitwise_and_expression() {
+    auto expression = parse_equality_expression();
+    if (!expression) {
+        return std::unexpected(expression.error());
+    }
+
+    while (match(TokenType::Amp)) {
         const auto op = previous();
         auto right = parse_equality_expression();
         if (!right) {
@@ -723,6 +1045,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_logical_and_
     return expression;
 }
 
+//== , !=
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_equality_expression() {
     auto expression = parse_relational_expression();
     if (!expression) {
@@ -743,15 +1066,37 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_equality_exp
 
     return expression;
 }
-
+//<,>,<=,>=
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_relational_expression() {
-    auto expression = parse_additive_expression();
+    auto expression = parse_shift_expression();
     if (!expression) {
         return std::unexpected(expression.error());
     }
 
     while (match_any({TokenType::Less, TokenType::Greater, TokenType::LessEqual,
                       TokenType::GreaterEqual})) {
+        const auto op = previous();
+        auto right = parse_shift_expression();
+        if (!right) {
+            return std::unexpected(right.error());
+        }
+
+        const auto range = combine_ranges(expression.value()->range, right.value()->range);
+        expression = std::unique_ptr<AST::Expr>(std::make_unique<AST::BinaryExpr>(
+            range, op.type, op.lexeme, std::move(expression.value()), std::move(right.value())));
+    }
+
+    return expression;
+}
+
+//<<,>>
+std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_shift_expression() {
+    auto expression = parse_additive_expression();
+    if (!expression) {
+        return std::unexpected(expression.error());
+    }
+
+    while (match_any({TokenType::ShiftLeft, TokenType::ShiftRight})) {
         const auto op = previous();
         auto right = parse_additive_expression();
         if (!right) {
@@ -766,6 +1111,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_relational_e
     return expression;
 }
 
+//+/-
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_additive_expression() {
     auto expression = parse_multiplicative_expression();
     if (!expression) {
@@ -787,6 +1133,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_additive_exp
     return expression;
 }
 
+//*, /, %
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_multiplicative_expression() {
     auto expression = parse_unary_expression();
     if (!expression) {
@@ -808,8 +1155,9 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_multiplicati
     return expression;
 }
 
+//унарные
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_unary_expression() {
-    if (match_any({TokenType::Minus, TokenType::Bang})) {
+    if (match_any({TokenType::Minus, TokenType::Bang, TokenType::Tilde})) {
         const auto op = previous();
         auto operand = parse_unary_expression();
         if (!operand) {
@@ -824,6 +1172,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_unary_expres
     return parse_cast_expression();
 }
 
+//явное привидение типа cast<int32>(..)
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_cast_expression() {
     if (!match(TokenType::Cast)) {
         return parse_postfix_expression();
@@ -866,24 +1215,46 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_cast_express
         range, std::move(target_type.value()), std::move(expression.value())));
 }
 
+//postfix-суффиксы
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_postfix_expression() {
     auto expression = parse_atom();
     if (!expression) {
         return std::unexpected(expression.error());
     }
 
-    // Postfix-операции можно наращивать цепочкой: call, index, field access.
-    // Поэтому после atom цикл продолжается, пока встречаются соответствующие суффиксы
+    // рostfix-операции можно наращивать цепочкой: call, index, field access
+    // поэтому после atom цикл продолжается, пока встречаются соответствующие суффиксы
     while (true) {
         if (match(TokenType::LeftParen)) {
-            std::vector<std::unique_ptr<AST::Expr>> arguments;
+            std::vector<AST::CallArgument> arguments;
             if (!check(TokenType::RightParen)) {
                 while (true) {
+                    std::optional<std::string> name;
+                    Lexer::SourceRange argument_range {};
+
+                    if (check(TokenType::Identifier) && check_next(TokenType::Assign)) {
+                        const auto named_token = advance();
+                        name = named_token.lexeme;
+                        argument_range = named_token.range;
+                        advance();
+                    }
+
                     auto argument = parse_expression();
                     if (!argument) {
                         return std::unexpected(argument.error());
                     }
-                    arguments.push_back(std::move(argument.value()));
+
+                    if (!name.has_value()) {
+                        argument_range = argument.value()->range;
+                    } else {
+                        argument_range = combine_ranges(argument_range, argument.value()->range);
+                    }
+
+                    arguments.push_back(AST::CallArgument {
+                        .name = std::move(name),
+                        .value = std::move(argument.value()),
+                        .range = argument_range,
+                    });
 
                     if (!match(TokenType::Comma)) {
                         break;
@@ -937,9 +1308,55 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_postfix_expr
     return expression;
 }
 
+//(доп A.2.1) читает if (cond) then_expr else else_expr
+std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_if_expression() {
+    auto if_token = consume(TokenType::If, "expected 'if'");
+    if (!if_token) {
+        return std::unexpected(if_token.error());
+    }
+
+    auto left_paren = consume(TokenType::LeftParen, "expected '(' after 'if'");
+    if (!left_paren) {
+        return std::unexpected(left_paren.error());
+    }
+
+    auto condition = parse_expression();
+    if (!condition) {
+        return std::unexpected(condition.error());
+    }
+
+    auto right_paren = consume(TokenType::RightParen, "expected ')' after if condition");
+    if (!right_paren) {
+        return std::unexpected(right_paren.error());
+    }
+
+    auto then_branch = parse_expression();
+    if (!then_branch) {
+        return std::unexpected(then_branch.error());
+    }
+
+    auto else_token = consume(TokenType::Else, "expected 'else' in if expression");
+    if (!else_token) {
+        return std::unexpected(else_token.error());
+    }
+
+    auto else_branch = parse_expression();
+    if (!else_branch) {
+        return std::unexpected(else_branch.error());
+    }
+
+    const auto range = combine_ranges(if_token->range, else_branch.value()->range);
+    return std::unique_ptr<AST::Expr>(std::make_unique<AST::IfExpr>(
+        range, std::move(condition.value()), std::move(then_branch.value()),
+        std::move(else_branch.value())));
+}
+//атомарные выражения
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_atom() {
-    // Atom - это самый нижний уровень выражений: литералы, идентификаторы,
-    // скобки и составные литералы
+    //  это самый нижний уровень выражений литералы, идентификаторы, скобки и составные литералы
+    if (check(TokenType::If)) {
+        return parse_if_expression();
+    }
+
     if (match(TokenType::IntLiteral)) {
         const auto token = previous();
         return std::unique_ptr<AST::Expr>(
@@ -1015,6 +1432,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_atom() {
     return std::unexpected(make_error(peek(), "expected expression"));
 }
 
+//литерал массива
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_array_literal() {
     auto left_bracket = consume(TokenType::LeftBracket, "expected '['");
     if (!left_bracket) {
@@ -1050,6 +1468,7 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_array_litera
         std::make_unique<AST::ArrayLiteralExpr>(range, std::move(elements)));
 }
 
+//литерал структуры Point { x: 10, y: 20 }
 std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_struct_literal(
     ParsedPath type_path) {
     auto left_brace = consume(TokenType::LeftBrace, "expected '{' after struct type");
@@ -1103,10 +1522,12 @@ std::expected<std::unique_ptr<AST::Expr>, ParseError> Parser::parse_struct_liter
         range, std::move(type_path.parts), std::move(fields)));
 }
 
+//может ли текущий токен быть началом типа
 bool Parser::is_type_start() const {
     return is_builtin_type_token(peek().type) || check(TokenType::Identifier);
 }
 
+//перечисляет все встроенные типы 
 bool Parser::is_builtin_type_token(TokenType type) const {
     switch (type) {
         case TokenType::Int8:
@@ -1128,7 +1549,8 @@ bool Parser::is_builtin_type_token(TokenType type) const {
             return false;
     }
 }
-
+ 
+//можно ли это выражение ставить слева от =
 bool Parser::is_assignable_expression(const AST::Expr& expr) const {
     return dynamic_cast<const AST::IdentifierExpr*>(&expr) != nullptr ||
            dynamic_cast<const AST::NamespaceAccessExpr*>(&expr) != nullptr ||
@@ -1136,4 +1558,4 @@ bool Parser::is_assignable_expression(const AST::Expr& expr) const {
            dynamic_cast<const AST::FieldAccessExpr*>(&expr) != nullptr;
 }
 
-}  
+} 

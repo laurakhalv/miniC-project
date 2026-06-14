@@ -1,4 +1,5 @@
 #include "codegen.hpp"
+
 #include <algorithm>
 #include <bit>
 #include <cctype>
@@ -17,29 +18,48 @@
 
 namespace {
 
-//проверяет, является ли имя одним из целочисленных типов языка
+
+//любой целочисленный тип (знаковый или беззнаковый)
 bool is_integer_name(std::string_view name) {
     return name == "int8" || name == "int16" || name == "int32" || name == "int64" ||
            name == "uint8" || name == "uint16" || name == "uint32" || name == "uint64";
 }
 
-//проверяет, является ли тип беззнаковым целым
+//только беззнаковые целые нужны для выбора setb/seta вместо setl/setg при сравнениях
 bool is_unsigned_integer_name(std::string_view name) {
     return name == "uint8" || name == "uint16" || name == "uint32" || name == "uint64";
 }
 
-//проверка на float32 / float64
+//вещественные типы используют runtime helpers вместо прямых инструкций
 bool is_float_name(std::string_view name) {
     return name == "float32" || name == "float64";
 }
 
-//отдельная проверка на char
+//символьный тип обрабатывается как 8-битное целое без знака
 bool is_char_name(std::string_view name) {
     return name == "char";
 }
 
-//округляет размер вверх до нужного выравнивания
-//используется в stack frame и при расчёте размеров структур
+//разрядность целого типа в битах
+//нужна для генерации сдвигов нельзя сдвигать int8 на 64 бита
+int integer_bit_width(std::string_view name) {
+    if (name == "int8" || name == "uint8") {
+        return 8;
+    }
+    if (name == "int16" || name == "uint16") {
+        return 16;
+    }
+    if (name == "int32" || name == "uint32") {
+        return 32;
+    }
+    if (name == "int64" || name == "uint64" || name == "char" || name == "bool") {
+        return 64;
+    }
+    return 64;
+}
+
+//выравнивает value вверх до кратного alignment
+//используется для выравнивания размера стека по 16 байт перед call (требование ABI)
 int align_to(int value, int alignment) {
     const int remainder = value % alignment;
     if (remainder == 0) {
@@ -48,20 +68,23 @@ int align_to(int value, int alignment) {
     return value + (alignment - remainder);
 }
 
-//берёт текст строкового литерала с кавычками и escape-последовательностями
-//и превращает его в реальную строку, которую потом можно положить в .rodata
+//преобразует текст строкового литерала "hello\n" в реальную строку с символом \n
+//убирает кавычки, заменяет escape-последовательности на настоящие символы
+//нужен перед помещением строки в .rodata — assembler ожидает уже декодированный текст
 std::string decode_string_literal(std::string_view lexeme) {
     std::string value;
     if (lexeme.size() < 2) {
         return value;
     }
 
+    //пропускаем открывающую кавычку (i=1) и закрывающую (i+1 < size)
     for (std::size_t i = 1; i + 1 < lexeme.size(); ++i) {
         if (lexeme[i] != '\\') {
             value.push_back(lexeme[i]);
             continue;
         }
 
+        //обрабатываем escape-последовательность
         ++i;
         switch (lexeme[i]) {
             case '\\':
@@ -85,8 +108,10 @@ std::string decode_string_literal(std::string_view lexeme) {
     return value;
 }
 
-//разбирает целочисленный литерал в число
-//поддерживает десятичную, hex (0x) и binary (0b) формы
+//парсит текст числового литерала (десятичный, 0x hex, 0b binary) в uint64_t
+//нужен для разбора размера массива из имени типа:
+//   "int32[3]" -парсим "3" - получаем 3
+//также используется в emit_expression для IntLiteralExpr
 std::expected<std::uint64_t, std::string> parse_unsigned_integer_literal(std::string_view text) {
     int base = 10;
     std::size_t start = 0;
@@ -125,8 +150,9 @@ std::expected<std::uint64_t, std::string> parse_unsigned_integer_literal(std::st
     return value;
 }
 
-//разбирает символьный литерал вроде 'A' или '\n'
-//и возвращает числовой код символа
+//преобразует символьный литерал 'A' или '\n' в числовой ASCII-код
+//кодоген кладёт этот код напрямую в rax: mov rax, 65 (для 'A')
+//это и есть представление char в runtime — просто 8-битное целое
 std::expected<std::uint64_t, std::string> decode_char_literal(std::string_view lexeme) {
     if (lexeme.size() < 3 || lexeme.front() != '\'' || lexeme.back() != '\'') {
         return std::unexpected("malformed character literal");
@@ -159,7 +185,9 @@ std::expected<std::uint64_t, std::string> decode_char_literal(std::string_view l
     }
 }
 
-//экранирует строку так, чтобы её можно было безопасно записать в asm как .asciz
+// экранирует строку для записи в assembly .asciz директиву
+//специальные символы заменяются на escape-представления
+//непечатаемые (< 32 или >= 127) — на восьмеричный escape \ooo.
 std::string escape_asm_string(std::string_view value) {
     std::string escaped;
     for (const char ch : value) {
@@ -192,10 +220,11 @@ std::string escape_asm_string(std::string_view value) {
     return escaped;
 }
 
-//превращает полное имя функции в безопасный label для assembly
-//например Math::sum -> __minic_fn_Math__sum
+// преобразует полное имя функции в допустимую assembly метку
+// main всегда остаётся "main" независимо от суффикса перегрузки
+// остальные функции получают префикс __minic_fn_ и замену спецсимволов, буквы и цифры остаются как есть, всё остальное → _HH (hex-код байта)
 std::string mangle_name(std::string_view full_name) {
-    if (full_name == "main") {
+    if (full_name == "main" || full_name.rfind("main#", 0) == 0) {
         return "main";
     }
 
@@ -204,20 +233,22 @@ std::string mangle_name(std::string_view full_name) {
         if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
             result.push_back(ch);
         } else {
-            result.push_back('_');
+            char buffer[8];
+            std::snprintf(buffer, sizeof(buffer), "_%02X",
+                          static_cast<unsigned char>(ch));
+            result += buffer;
         }
     }
     return result;
 }
 
-//форматирует 32-битное значение как hex-строку для asm
+
 std::string format_u32_hex(std::uint32_t value) {
     std::ostringstream stream;
     stream << "0x" << std::hex << value;
     return stream.str();
 }
 
-//форматирует 64-битное значение как hex-строку для asm
 std::string format_u64_hex(std::uint64_t value) {
     std::ostringstream stream;
     stream << "0x" << std::hex << value;
@@ -228,7 +259,6 @@ std::string format_u64_hex(std::uint64_t value) {
 
 namespace Codegen {
 
-//собирает диагностику codegen в общий строковый формат
 std::string format_error(const CodegenError& error) {
     std::ostringstream stream;
     stream << error.filename << ':' << error.location.line << ':' << error.location.column
@@ -236,37 +266,54 @@ std::string format_error(const CodegenError& error) {
     return stream.str();
 }
 
-//главный backend-объект
-//он получает AST + SemanticResult и постепенно собирает текст x86-64 assembly
 class Generator {
   private:
-    //регистры, через которые по ABI передаются первые аргументы функций
+    // регистры для передачи первых 6 аргументов по System V AMD64 ABI
+    // вызов add(a, b): a- rdi, b -rsi
     static constexpr const char* kArgumentRegisters[6] = {"rdi", "rsi", "rdx",
                                                            "rcx", "r8",  "r9"};
 
-    //описание локального storage: тип переменной и её смещение в stack frame
+    //описание где хранится локальная переменная или параметр
+    //все переменные живут на стеке по адресу [rbp - offset]
     struct Storage {
         Semantic::SemanticType type {};
-        int offset = 0;
+        int offset = 0;  // смещение от rbp: mov rax, [rbp - offset]
     };
 
-    //вся временная информация о функции во время генерации
+    //контекст генерации одной функции
+    //создаётся при входе в emit_function, уничтожается при выходе
     struct FunctionContext {
+        // буфер куда пишутся инструкции тела функции
         std::ostringstream body;
+
+        // стек областей видимости
+        // При выходе из блока слой удаляетсяпеременные становятся недоступны
         std::vector<std::unordered_map<std::string, Storage>> scopes;
+
+        // стеки меток для break и continue
         std::vector<std::string> break_labels;
         std::vector<std::string> continue_labels;
+
+        // пул временных слотов на стеке для промежуточных значений
+        // нужны при вычислении выражений
         std::vector<int> temp_slots;
-        int temp_depth = 0;
+        int temp_depth = 0;  // сколько слотов сейчас занято
+
+    //смещение на стеке
         int next_stack_offset = 0;
         std::string exit_label {};
+
+ 
         Semantic::SemanticType return_type {};
+
+      
         std::optional<int> aggregate_return_pointer_offset;
     };
 
   public:
-    //конструктор запоминает программу и семантические таблицы
-    //и сразу подготавливает быстрый доступ к функциям и структурам
+    // конструктор заполняет вспомогательные словари для быстрого поиска:
+//FunctionInfo (при генерации вызовов)
+    // StructInfo (при вычислении смещений полей)
     Generator(const AST::Program& program, const Semantic::SemanticResult& semantic_result,
               std::string filename)
         : program_(program),
@@ -282,8 +329,8 @@ class Generator {
         }
     }
 
-    //главная функция backend
-    //собирает секции .text и .rodata, а потом возвращает весь asm как одну строку
+    // главная точка входа генерирует весь .s файл
+
     std::expected<std::string, CodegenError> generate() {
         text_ << ".intel_syntax noprefix\n";
         text_ << ".text\n";
@@ -309,16 +356,17 @@ class Generator {
     const AST::Program& program_;
     const Semantic::SemanticResult& semantic_result_;
     std::string filename_;
-    std::ostringstream text_;   //сюда пишем исполняемый код функций
-    std::ostringstream rodata_; //сюда пишем строковые литералы и другие readonly данные
-    int label_counter_ = 0;
-    int string_counter_ = 0;
-    std::unordered_map<std::string, std::string> string_labels_;
+    std::ostringstream text_;    // код функций
+    std::ostringstream rodata_;  // строковые константы
+    int label_counter_ = 0;      // счётчик для генерации уникальных меток 
+    int string_counter_ = 0;     // счётчик строковых констант 
+    std::unordered_map<std::string, std::string> string_labels_;  // кэш интернированных строк
     std::unordered_map<const AST::FunctionDecl*, std::string> function_names_;
     std::unordered_map<std::string, const Semantic::FunctionInfo*> functions_by_name_;
     std::unordered_map<std::string, const Semantic::StructInfo*> structs_by_name_;
-    FunctionContext* current_function_ = nullptr;
+    FunctionContext* current_function_ = nullptr;  // контекст функции которую сейчас генерируем
 
+   
     [[nodiscard]] CodegenError make_error(const Lexer::SourceRange& range,
                                           std::string message) const {
         return CodegenError {
@@ -337,8 +385,8 @@ class Generator {
         };
     }
 
-    //проходит по top-level объявлениям и генерирует код только для функций
-    //struct/alias/namespace сами по себе asm не дают
+    // Обходит список объявлений и генерирует код для каждого
+
     std::expected<void, CodegenError> emit_declarations(
         const std::vector<std::unique_ptr<AST::Decl>>& declarations) {
         for (const auto& declaration : declarations) {
@@ -347,6 +395,16 @@ class Generator {
                 auto nested = emit_declarations(name_space->declarations);
                 if (!nested) {
                     return std::unexpected(nested.error());
+                }
+                continue;
+            }
+
+            if (const auto* structure = dynamic_cast<const AST::StructDecl*>(declaration.get())) {
+                for (const auto& method : structure->methods) {
+                    auto emitted = emit_function(*method);
+                    if (!emitted) {
+                        return std::unexpected(emitted.error());
+                    }
                 }
                 continue;
             }
@@ -365,8 +423,9 @@ class Generator {
         return {};
     }
 
-    //генерация одной функции целиком:
-    //пролог, параметры, тело, общий выход и эпилог
+   
+  //генерирует весь код одной функции
+    
     std::expected<void, CodegenError> emit_function(const AST::FunctionDecl& function) {
         const auto info_it = semantic_result_.functions.find(&function);
         if (info_it == semantic_result_.functions.end()) {
@@ -375,8 +434,6 @@ class Generator {
         }
 
         const auto& function_info = info_it->second;
-        //если функция возвращает struct/array,
-        //результат передаётся через скрытый указатель на память вызывающей стороны
         const bool aggregate_return = is_aggregate_runtime_type(function_info.return_type);
         const std::size_t required_registers =
             function_info.parameter_types.size() + (aggregate_return ? 1 : 0);
@@ -401,7 +458,6 @@ class Generator {
 
         std::size_t register_index = 0;
         if (aggregate_return) {
-            //сохраняем hidden return pointer в локальный слот функции
             const int hidden_offset = allocate_stack_slot();
             context.aggregate_return_pointer_offset = hidden_offset;
             emit_body_line("mov qword ptr [rbp - " + std::to_string(hidden_offset) + "], " +
@@ -409,11 +465,49 @@ class Generator {
             ++register_index;
         }
 
+        if (function_info.is_method) {
+            const auto& self_type = function_info.parameter_types[0];
+            auto supported = ensure_supported_type(self_type, function.range);
+            if (!supported) {
+                current_function_ = nullptr;
+                return std::unexpected(supported.error());
+            }
+
+            const int incoming_self_offset = allocate_stack_slot();
+            emit_body_line("mov qword ptr [rbp - " + std::to_string(incoming_self_offset) + "], " +
+                           std::string(kArgumentRegisters[register_index]));
+            ++register_index;
+
+            if (is_scalar_runtime_type(self_type)) {
+                current_function_->scopes.back().emplace("self", Storage {
+                                                                    .type = self_type,
+                                                                    .offset = incoming_self_offset,
+                                                                });
+            } else {
+                auto size = type_size(self_type, function.range);
+                if (!size) {
+                    current_function_ = nullptr;
+                    return std::unexpected(size.error());
+                }
+                const int local_offset = allocate_stack_bytes(*size);
+                current_function_->scopes.back().emplace("self", Storage {
+                                                                    .type = self_type,
+                                                                    .offset = local_offset,
+                                                                });
+                emit_body_line("lea rdi, [rbp - " + std::to_string(local_offset) + "]");
+                emit_body_line("mov rsi, qword ptr [rbp - " + std::to_string(incoming_self_offset) +
+                               "]");
+                emit_body_line("mov rdx, " + std::to_string(*size));
+                emit_body_line("call memcpy");
+            }
+        }
+
         std::vector<int> incoming_parameter_slots;
         incoming_parameter_slots.reserve(function.parameters.size());
         for (std::size_t i = 0; i < function.parameters.size(); ++i) {
             const auto& parameter = function.parameters[i];
-            const auto& parameter_type = function_info.parameter_types[i];
+            const auto& parameter_type =
+                function_info.parameter_types[i + (function_info.is_method ? 1 : 0)];
 
             auto supported = ensure_supported_type(parameter_type, parameter.range);
             if (!supported) {
@@ -422,7 +516,6 @@ class Generator {
             }
 
             const int incoming_offset = allocate_stack_slot();
-            //сначала сохраняем все входные аргументы из регистров в стек
             emit_body_line("mov qword ptr [rbp - " + std::to_string(incoming_offset) + "], " +
                            std::string(kArgumentRegisters[register_index]));
             incoming_parameter_slots.push_back(incoming_offset);
@@ -431,11 +524,11 @@ class Generator {
 
         for (std::size_t i = 0; i < function.parameters.size(); ++i) {
             const auto& parameter = function.parameters[i];
-            const auto& parameter_type = function_info.parameter_types[i];
+            const auto& parameter_type =
+                function_info.parameter_types[i + (function_info.is_method ? 1 : 0)];
             const int incoming_offset = incoming_parameter_slots[i];
 
             if (is_scalar_runtime_type(parameter_type)) {
-                //скаляры можно просто хранить как 64-битное значение в стеке
                 current_function_->scopes.back().emplace(parameter.name, Storage {
                                                                          .type = parameter_type,
                                                                          .offset = incoming_offset,
@@ -454,7 +547,6 @@ class Generator {
                                                                      .type = parameter_type,
                                                                      .offset = local_offset,
                                                                  });
-            //aggregate-параметры копируем по значению через memcpy
             emit_body_line("lea rdi, [rbp - " + std::to_string(local_offset) + "]");
             emit_body_line("mov rsi, qword ptr [rbp - " + std::to_string(incoming_offset) + "]");
             emit_body_line("mov rdx, " + std::to_string(*size));
@@ -469,7 +561,6 @@ class Generator {
 
         emit_body_label(context.exit_label);
         if (context.aggregate_return_pointer_offset.has_value()) {
-            //для aggregate-return в rax возвращаем адрес буфера результата
             emit_body_line("mov rax, qword ptr [rbp - " +
                            std::to_string(*context.aggregate_return_pointer_offset) + "]");
         }
@@ -495,8 +586,8 @@ class Generator {
         return {};
     }
 
-    //генерация блока { ... }
-    //при необходимости открывает отдельный scope локальных переменных
+    // Генерирует блок { инструкции }
+
     std::expected<void, CodegenError> emit_block(const AST::BlockStmt& block, bool create_scope) {
         if (create_scope) {
             current_function_->scopes.push_back({});
@@ -519,13 +610,13 @@ class Generator {
         return {};
     }
 
-    //генерация одной инструкции
+    //определяет тип узла и вызывает нужную генерацию
+
     std::expected<void, CodegenError> emit_statement(const AST::Stmt& statement) {
         if (const auto* block = dynamic_cast<const AST::BlockStmt*>(&statement)) {
             return emit_block(*block, true);
         }
 
-        //локальная переменная
         if (const auto* declaration = dynamic_cast<const AST::VariableDeclStmt*>(&statement)) {
             auto type = lookup_variable_type(*declaration);
             if (!type) {
@@ -541,7 +632,6 @@ class Generator {
             const int offset = allocate_stack_bytes(storage_size);
 
             if (is_scalar_runtime_type(*type)) {
-                //для scalar-значений вычисляем initializer в rax и кладём в стек
                 auto initializer = emit_expression(*declaration->initializer);
                 if (!initializer) {
                     return std::unexpected(initializer.error());
@@ -552,8 +642,6 @@ class Generator {
                 }
                 emit_body_line("mov qword ptr [rbp - " + std::to_string(offset) + "], rax");
             } else {
-                //для array/struct сначала получаем адрес места назначения,
-                //а потом копируем туда всё значение
                 emit_body_line("lea rdi, [rbp - " + std::to_string(offset) + "]");
                 auto stored =
                     emit_store_expression_to_rdi(*declaration->initializer, *type);
@@ -569,7 +657,6 @@ class Generator {
             return {};
         }
 
-        //if / else через label и условные прыжки
         if (const auto* if_stmt = dynamic_cast<const AST::IfStmt*>(&statement)) {
             const auto else_label = new_label(".Lelse");
             const auto end_label = new_label(".Lendif");
@@ -604,7 +691,6 @@ class Generator {
             return {};
         }
 
-        //while тоже lowering в label + jmp
         if (const auto* while_stmt = dynamic_cast<const AST::WhileStmt*>(&statement)) {
             const auto start_label = new_label(".Lwhile_start");
             const auto body_label = new_label(".Lwhile_body");
@@ -638,12 +724,9 @@ class Generator {
             return {};
         }
 
-        //return
         if (const auto* return_stmt = dynamic_cast<const AST::ReturnStmt*>(&statement)) {
             if (return_stmt->value != nullptr) {
                 if (is_aggregate_runtime_type(current_function_->return_type)) {
-                    //если возвращаем array/struct,
-                    //пишем результат по скрытому адресу, который дал caller
                     if (!current_function_->aggregate_return_pointer_offset.has_value()) {
                         return std::unexpected(make_error(
                             statement.range,
@@ -665,7 +748,6 @@ class Generator {
                     return {};
                 }
 
-                //обычный scalar-return: вычислили значение и нормализовали его
                 auto emitted = emit_expression(*return_stmt->value);
                 if (!emitted) {
                     return std::unexpected(emitted.error());
@@ -679,7 +761,6 @@ class Generator {
             return {};
         }
 
-        //break и continue просто прыгают на заранее сохранённые label'ы
         if (dynamic_cast<const AST::BreakStmt*>(&statement) != nullptr) {
             emit_body_line("jmp " + current_function_->break_labels.back());
             return {};
@@ -690,7 +771,6 @@ class Generator {
             return {};
         }
 
-        //инструкция-выражение: либо scalar expression, либо aggregate context
         if (const auto* expression_stmt = dynamic_cast<const AST::ExprStmt*>(&statement)) {
             auto type = expression_type(*expression_stmt->expression);
             if (!type) {
@@ -711,15 +791,15 @@ class Generator {
         return std::unexpected(make_error(statement.range, "unsupported statement in codegen"));
     }
 
-    //генерация выражения
-    //по контракту результат scalar-выражения обычно оказывается в rax
+   
+    //генерирует вычисление выражения
+
     std::expected<void, CodegenError> emit_expression(const AST::Expr& expression) {
         auto type = expression_type(expression);
         if (!type) {
             return std::unexpected(type.error());
         }
 
-        //чтение локальной scalar-переменной
         if (const auto* identifier = dynamic_cast<const AST::IdentifierExpr*>(&expression)) {
             if (!is_scalar_runtime_type(*type)) {
                 return std::unexpected(make_error(
@@ -735,7 +815,6 @@ class Generator {
             return normalize_rax(*type, expression.range);
         }
 
-        //целочисленный литерал -> mov rax, <value>
         if (const auto* literal = dynamic_cast<const AST::IntLiteralExpr*>(&expression)) {
             auto parsed = parse_unsigned_integer_literal(literal->value);
             if (!parsed) {
@@ -746,20 +825,44 @@ class Generator {
             return normalize_rax(*type, expression.range);
         }
 
-        //bool literal -> 0 или 1
         if (const auto* literal = dynamic_cast<const AST::BoolLiteralExpr*>(&expression)) {
             emit_body_line(std::string("mov rax, ") + (literal->value ? "1" : "0"));
             return {};
         }
 
-        //string literal -> адрес строки в .rodata
+        if (const auto* if_expr = dynamic_cast<const AST::IfExpr*>(&expression)) {
+            const auto else_label = new_label(".Lif_else");
+            const auto end_label = new_label(".Lif_end");
+
+            auto condition_emitted = emit_expression(*if_expr->condition);
+            if (!condition_emitted) {
+                return std::unexpected(condition_emitted.error());
+            }
+            emit_body_line("cmp rax, 0");
+            emit_body_line("je " + else_label);
+
+            auto then_emitted = emit_expression(*if_expr->then_branch);
+            if (!then_emitted) {
+                return std::unexpected(then_emitted.error());
+            }
+            emit_body_line("jmp " + end_label);
+
+            emit_body_label(else_label);
+            auto else_emitted = emit_expression(*if_expr->else_branch);
+            if (!else_emitted) {
+                return std::unexpected(else_emitted.error());
+            }
+
+            emit_body_label(end_label);
+            return {};
+        }
+
         if (const auto* literal = dynamic_cast<const AST::StringLiteralExpr*>(&expression)) {
             const auto label = intern_string(decode_string_literal(literal->value));
             emit_body_line("lea rax, [rip + " + label + "]");
             return {};
         }
 
-        //char literal -> его числовой код
         if (const auto* literal = dynamic_cast<const AST::CharLiteralExpr*>(&expression)) {
             auto decoded = decode_char_literal(literal->value);
             if (!decoded) {
@@ -770,7 +873,6 @@ class Generator {
             return normalize_rax(*type, expression.range);
         }
 
-        //float literal -> его битовое представление
         if (const auto* literal = dynamic_cast<const AST::FloatLiteralExpr*>(&expression)) {
             if (!is_float_name(type->name)) {
                 return std::unexpected(make_error(
@@ -779,8 +881,19 @@ class Generator {
             return emit_float_literal(*literal, *type);
         }
 
-        //унарные операции
         if (const auto* unary = dynamic_cast<const AST::UnaryExpr*>(&expression)) {
+            const auto overloaded =
+                semantic_result_.resolved_unary_operator_calls.find(unary);
+            if (overloaded != semantic_result_.resolved_unary_operator_calls.end()) {
+                const auto args_it = semantic_result_.resolved_unary_operator_arguments.find(unary);
+                if (args_it == semantic_result_.resolved_unary_operator_arguments.end()) {
+                    return std::unexpected(make_error(
+                        expression.range,
+                        "internal error: missing overloaded unary operator arguments"));
+                }
+                return emit_resolved_function_call(overloaded->second, args_it->second, expression.range);
+            }
+
             auto emitted = emit_expression(*unary->operand);
             if (!emitted) {
                 return std::unexpected(emitted.error());
@@ -802,18 +915,20 @@ class Generator {
                     emit_body_line("movzx rax, al");
                     return {};
 
+                case Lexer::TokenType::Tilde:
+                    emit_body_line("not rax");
+                    return normalize_rax(*type, expression.range);
+
                 default:
                     return std::unexpected(
                         make_error(expression.range, "unsupported unary operator in codegen"));
             }
         }
 
-        //бинарные операции вынесены отдельно, потому что это большой блок логики
         if (const auto* binary = dynamic_cast<const AST::BinaryExpr*>(&expression)) {
             return emit_binary_expression(*binary);
         }
 
-        //cast<T>(expr)
         if (const auto* cast = dynamic_cast<const AST::CastExpr*>(&expression)) {
             auto source_type = expression_type(*cast->expression);
             if (!source_type) {
@@ -827,13 +942,10 @@ class Generator {
             return emit_numeric_cast_expression(*cast->expression, *source_type, *type);
         }
 
-        //вызов функции или builtin
         if (const auto* call = dynamic_cast<const AST::CallExpr*>(&expression)) {
             return emit_call_expression(*call);
         }
 
-        //assignment как выражение:
-        //сначала вычисляем адрес слева, потом значение справа и записываем его
         if (const auto* assignment = dynamic_cast<const AST::AssignmentExpr*>(&expression)) {
             if (!is_scalar_runtime_type(*type)) {
                 return std::unexpected(make_error(
@@ -867,7 +979,6 @@ class Generator {
             return {};
         }
 
-        //чтение scalar-элемента массива
         if (const auto* index = dynamic_cast<const AST::IndexExpr*>(&expression)) {
             if (!is_scalar_runtime_type(*type)) {
                 return std::unexpected(make_error(
@@ -883,7 +994,6 @@ class Generator {
             return normalize_rax(*type, expression.range);
         }
 
-        //чтение scalar-поля структуры
         if (const auto* field = dynamic_cast<const AST::FieldAccessExpr*>(&expression)) {
             if (!is_scalar_runtime_type(*type)) {
                 return std::unexpected(make_error(
@@ -914,10 +1024,19 @@ class Generator {
         return std::unexpected(make_error(expression.range, "unsupported expression in codegen"));
     }
 
-    //генерация бинарных операторов
-    //сюда попадает и arithmetic, и comparisons, и short-circuit логика
+    
+    // генерирует бинарную операцию a OP b
     std::expected<void, CodegenError> emit_binary_expression(const AST::BinaryExpr& binary) {
-        //логическое И с short-circuit
+        const auto overloaded = semantic_result_.resolved_binary_operator_calls.find(&binary);
+        if (overloaded != semantic_result_.resolved_binary_operator_calls.end()) {
+            const auto args_it = semantic_result_.resolved_binary_operator_arguments.find(&binary);
+            if (args_it == semantic_result_.resolved_binary_operator_arguments.end()) {
+                return std::unexpected(make_error(
+                    binary.range, "internal error: missing overloaded operator arguments"));
+            }
+            return emit_resolved_function_call(overloaded->second, args_it->second, binary.range);
+        }
+
         if (binary.op_type == Lexer::TokenType::AmpAmp) {
             const auto false_label = new_label(".Land_false");
             const auto end_label = new_label(".Land_end");
@@ -943,7 +1062,6 @@ class Generator {
             return {};
         }
 
-        //логическое ИЛИ с short-circuit
         if (binary.op_type == Lexer::TokenType::PipePipe) {
             const auto true_label = new_label(".Lor_true");
             const auto end_label = new_label(".Lor_end");
@@ -985,8 +1103,6 @@ class Generator {
         if ((binary.op_type == Lexer::TokenType::EqualEqual ||
              binary.op_type == Lexer::TokenType::BangEqual) &&
             is_aggregate_runtime_type(*left_type)) {
-            //для arrays/structs equality считается не через cmp rax, rcx,
-            //а через отдельный поэлементный обход
             const int left_slot = acquire_temp_slot();
             const int right_slot = acquire_temp_slot();
 
@@ -1021,9 +1137,6 @@ class Generator {
         }
 
         const int temp_offset = acquire_temp_slot();
-        //обычная схема для scalar binary expression:
-        //левый операнд временно сохраняем в стек,
-        //правый кладём в rcx, левый возвращаем в rax
         auto left = emit_expression(*binary.left);
         if (!left) {
             release_temp_slot();
@@ -1042,7 +1155,6 @@ class Generator {
 
         if (binary.op_type == Lexer::TokenType::Plus && left_type->name == "string" &&
             right_type->name == "string") {
-            //конкатенация строк уходит в runtime helper
             emit_body_line("mov rdi, rax");
             emit_body_line("mov rsi, rcx");
             emit_body_line("call __minic_rt_concat");
@@ -1050,7 +1162,6 @@ class Generator {
         }
 
         if (is_float_name(left_type->name)) {
-            //для float-операций используем runtime helpers
             return emit_float_binary_expression(binary, *left_type);
         }
 
@@ -1066,6 +1177,47 @@ class Generator {
             case Lexer::TokenType::Star:
                 emit_body_line("imul rax, rcx");
                 return normalize_rax(*result_type, binary.range);
+
+            case Lexer::TokenType::Amp:
+                emit_body_line("and rax, rcx");
+                return normalize_rax(*result_type, binary.range);
+
+            case Lexer::TokenType::Pipe:
+                emit_body_line("or rax, rcx");
+                return normalize_rax(*result_type, binary.range);
+
+            case Lexer::TokenType::Caret:
+                emit_body_line("xor rax, rcx");
+                return normalize_rax(*result_type, binary.range);
+
+            case Lexer::TokenType::ShiftLeft:
+            case Lexer::TokenType::ShiftRight: {
+                const int width = integer_bit_width(left_type->name);
+                const auto invalid_label = new_label(".Lshift_invalid");
+                const auto end_label = new_label(".Lshift_end");
+
+                if (!is_unsigned_integer_name(right_type->name)) {
+                    emit_body_line("cmp rcx, 0");
+                    emit_body_line("jl " + invalid_label);
+                }
+
+                emit_body_line("cmp rcx, " + std::to_string(width));
+                emit_body_line("jae " + invalid_label);
+
+                if (binary.op_type == Lexer::TokenType::ShiftLeft) {
+                    emit_body_line("shl rax, cl");
+                } else if (is_unsigned_integer_name(left_type->name)) {
+                    emit_body_line("shr rax, cl");
+                } else {
+                    emit_body_line("sar rax, cl");
+                }
+
+                emit_body_line("jmp " + end_label);
+                emit_body_label(invalid_label);
+                emit_body_line("mov rax, 0");
+                emit_body_label(end_label);
+                return normalize_rax(*result_type, binary.range);
+            }
 
             case Lexer::TokenType::Slash:
             case Lexer::TokenType::Percent: {
@@ -1124,8 +1276,6 @@ class Generator {
         }
     }
 
-    //сравнение двух scalar-значений на равенство
-    //в зависимости от типа выбирается разный путь: strcmp, runtime helper или обычный cmp
     std::expected<void, CodegenError> emit_scalar_equality_result(
         const Semantic::SemanticType& type, std::string_view left_reg,
         std::string_view right_reg, const Lexer::SourceRange& range) {
@@ -1157,9 +1307,6 @@ class Generator {
             make_error(range, "codegen does not yet support equality for type '" + type.name + '\''));
     }
 
-    //сравнение значений по двум адресам в памяти
-    //если тип scalar — просто читаем значения и сравниваем
-    //если aggregate — уходим в более глубокий обход
     std::expected<void, CodegenError> emit_equality_result_from_addresses(
         const Semantic::SemanticType& type, std::string_view left_addr_reg,
         std::string_view right_addr_reg, const Lexer::SourceRange& range) {
@@ -1181,7 +1328,6 @@ class Generator {
         return compared;
     }
 
-    //поэлементное сравнение массивов и структур
     std::expected<void, CodegenError> emit_aggregate_equality_result(
         const Semantic::SemanticType& type, int left_slot, int right_slot,
         const Lexer::SourceRange& range) {
@@ -1270,18 +1416,14 @@ class Generator {
             make_error(range, "internal error: aggregate equality requires array or struct type"));
     }
 
-    //имя runtime helper для float-типов
     [[nodiscard]] std::string runtime_float_name(const Semantic::SemanticType& type) const {
         return type.name == "float32" ? "f32" : "f64";
     }
 
-    //имя runtime helper для integer-типов
     [[nodiscard]] std::string runtime_integer_name(const Semantic::SemanticType& type) const {
         return is_unsigned_integer_name(type.name) ? "u64" : "i64";
     }
 
-    //float literal превращаем в его битовый образ,
-    //потому что backend хранит float как raw bits в rax/eax
     std::expected<void, CodegenError> emit_float_literal(const AST::FloatLiteralExpr& literal,
                                                          const Semantic::SemanticType& type) {
         try {
@@ -1302,7 +1444,6 @@ class Generator {
         }
     }
 
-    //проверка деления float на ноль через runtime helper
     std::expected<void, CodegenError> emit_float_division_zero_check(
         const Semantic::SemanticType& type, const Lexer::SourceRange& range) {
         const auto non_zero = new_label(".Lfdiv_ok");
@@ -1316,7 +1457,6 @@ class Generator {
         return {};
     }
 
-    //все float-операции lowering'ятся в вызовы runtime
     std::expected<void, CodegenError> emit_float_binary_expression(
         const AST::BinaryExpr& binary, const Semantic::SemanticType& type) {
         if (binary.op_type == Lexer::TokenType::Slash ||
@@ -1370,7 +1510,6 @@ class Generator {
         }
     }
 
-    //явные numeric cast'ы: int -> float, float -> int, float -> float
     std::expected<void, CodegenError> emit_numeric_cast_expression(
         const AST::Expr& operand, const Semantic::SemanticType& source_type,
         const Semantic::SemanticType& target_type) {
@@ -1412,8 +1551,6 @@ class Generator {
                                target_type.name + '\''));
     }
 
-    //cast<string>(...)
-    //складываем operand в rdi и зовём нужный runtime helper
     std::expected<void, CodegenError> emit_string_cast_expression(
         const AST::Expr& operand, const Semantic::SemanticType& source_type) {
         auto emitted = emit_expression(operand);
@@ -1443,15 +1580,20 @@ class Generator {
             operand.range, "unsupported cast to 'string' from '" + source_type.name + '\''));
     }
 
-    //вызов функции:
-    //сначала проверяем, не builtin ли это,
-    //иначе подготавливаем аргументы и делаем обычный call
+    
+    //генерирует вызов функции
     std::expected<void, CodegenError> emit_call_expression(const AST::CallExpr& call) {
-        const auto resolved = semantic_result_.resolved_functions.find(call.callee.get());
-        if (resolved == semantic_result_.resolved_functions.end()) {
+        const auto resolved = semantic_result_.resolved_calls.find(&call);
+        if (resolved == semantic_result_.resolved_calls.end()) {
             return std::unexpected(
                 make_error(call.range, "internal error: unresolved callee in codegen"));
         }
+        const auto args_it = semantic_result_.resolved_call_arguments.find(&call);
+        if (args_it == semantic_result_.resolved_call_arguments.end()) {
+            return std::unexpected(
+                make_error(call.range, "internal error: unresolved call arguments in codegen"));
+        }
+        const auto& resolved_arguments = args_it->second;
 
         if (resolved->second == "print") {
             return emit_builtin_print(call);
@@ -1489,28 +1631,27 @@ class Generator {
         }
 
         std::vector<int> argument_offsets;
-        //вычисляем все аргументы заранее и временно складываем их в стек
-        argument_offsets.reserve(call.arguments.size());
-        for (std::size_t i = 0; i < call.arguments.size(); ++i) {
-            auto supported = ensure_supported_type(info->parameter_types[i], call.arguments[i]->range);
+        argument_offsets.reserve(resolved_arguments.size());
+        for (std::size_t i = 0; i < resolved_arguments.size(); ++i) {
+            auto supported = ensure_supported_type(info->parameter_types[i], resolved_arguments[i]->range);
             if (!supported) {
                 return std::unexpected(supported.error());
             }
 
             const int offset = acquire_temp_slot();
             if (is_aggregate_runtime_type(info->parameter_types[i])) {
-                auto emitted = emit_aggregate_source_address(*call.arguments[i]);
+                auto emitted = emit_aggregate_source_address(*resolved_arguments[i]);
                 if (!emitted) {
                     release_temp_slot();
                     return std::unexpected(emitted.error());
                 }
             } else {
-                auto emitted = emit_expression(*call.arguments[i]);
+                auto emitted = emit_expression(*resolved_arguments[i]);
                 if (!emitted) {
                     release_temp_slot();
                     return std::unexpected(emitted.error());
                 }
-                auto normalized = normalize_rax(info->parameter_types[i], call.arguments[i]->range);
+                auto normalized = normalize_rax(info->parameter_types[i], resolved_arguments[i]->range);
                 if (!normalized) {
                     release_temp_slot();
                     return std::unexpected(normalized.error());
@@ -1521,7 +1662,6 @@ class Generator {
         }
 
         for (std::size_t i = 0; i < argument_offsets.size(); ++i) {
-            //раскладываем аргументы по ABI-регистрам
             emit_body_line("mov " + std::string(kArgumentRegisters[i]) + ", qword ptr [rbp - " +
                            std::to_string(argument_offsets[i]) + "]");
         }
@@ -1533,23 +1673,165 @@ class Generator {
         return normalize_rax(info->return_type, call.range);
     }
 
-    //builtin print
-    std::expected<void, CodegenError> emit_builtin_print(const AST::CallExpr& call) {
-        if (call.arguments.size() != 1) {
-            return std::unexpected(make_error(call.range, "builtin 'print' expects 1 argument"));
+    std::expected<void, CodegenError> emit_resolved_function_call(
+        const std::string& resolved_name, const std::vector<const AST::Expr*>& resolved_arguments,
+        const Lexer::SourceRange& range) {
+        const auto info_it = functions_by_name_.find(resolved_name);
+        if (info_it == functions_by_name_.end()) {
+            return std::unexpected(make_error(
+                range, "internal error: missing function info for '" + resolved_name + '\''));
+        }
+        const auto* info = info_it->second;
+        if (info->parameter_types.size() > 6) {
+            return std::unexpected(
+                make_error(range, "codegen currently supports at most 6 call arguments"));
+        }
+        if (!is_scalar_runtime_type(info->return_type) && info->return_type.name != "void") {
+            return std::unexpected(make_error(
+                range, "aggregate-return function can only be used in an aggregate context"));
         }
 
-        auto argument_type = expression_type(*call.arguments[0]);
+        std::vector<int> argument_offsets;
+        argument_offsets.reserve(resolved_arguments.size());
+        for (std::size_t i = 0; i < resolved_arguments.size(); ++i) {
+            auto supported = ensure_supported_type(info->parameter_types[i], resolved_arguments[i]->range);
+            if (!supported) {
+                return std::unexpected(supported.error());
+            }
+
+            const int offset = acquire_temp_slot();
+            if (is_aggregate_runtime_type(info->parameter_types[i])) {
+                auto emitted = emit_aggregate_source_address(*resolved_arguments[i]);
+                if (!emitted) {
+                    release_temp_slot();
+                    return std::unexpected(emitted.error());
+                }
+            } else {
+                auto emitted = emit_expression(*resolved_arguments[i]);
+                if (!emitted) {
+                    release_temp_slot();
+                    return std::unexpected(emitted.error());
+                }
+                auto normalized = normalize_rax(info->parameter_types[i], resolved_arguments[i]->range);
+                if (!normalized) {
+                    release_temp_slot();
+                    return std::unexpected(normalized.error());
+                }
+            }
+            emit_body_line("mov qword ptr [rbp - " + std::to_string(offset) + "], rax");
+            argument_offsets.push_back(offset);
+        }
+
+        for (std::size_t i = 0; i < argument_offsets.size(); ++i) {
+            emit_body_line("mov " + std::string(kArgumentRegisters[i]) + ", qword ptr [rbp - " +
+                           std::to_string(argument_offsets[i]) + "]");
+        }
+        for (std::size_t i = 0; i < argument_offsets.size(); ++i) {
+            release_temp_slot();
+        }
+
+        emit_body_line("call " + mangle_name(resolved_name));
+        return normalize_rax(info->return_type, range);
+    }
+
+    std::expected<void, CodegenError> emit_aggregate_resolved_function_call(
+        const std::string& resolved_name, const std::vector<const AST::Expr*>& resolved_arguments,
+        const Semantic::SemanticType& result_type, const Lexer::SourceRange& range) {
+        const auto info_it = functions_by_name_.find(resolved_name);
+        if (info_it == functions_by_name_.end()) {
+            return std::unexpected(make_error(
+                range, "internal error: missing function info for '" + resolved_name + '\''));
+        }
+
+        const auto* info = info_it->second;
+        if (!is_aggregate_runtime_type(info->return_type)) {
+            return std::unexpected(
+                make_error(range, "internal error: scalar-return function used in aggregate context"));
+        }
+
+        const std::size_t required_registers = info->parameter_types.size() + 1;
+        if (required_registers > 6) {
+            return std::unexpected(make_error(
+                range, "codegen currently supports at most 6 register arguments per call"));
+        }
+
+        auto size = type_size(result_type, range);
+        if (!size) {
+            return std::unexpected(size.error());
+        }
+
+        const int result_offset = allocate_stack_bytes(*size);
+        const int result_pointer_slot = acquire_temp_slot();
+        emit_body_line("lea rax, [rbp - " + std::to_string(result_offset) + "]");
+        emit_body_line("mov qword ptr [rbp - " + std::to_string(result_pointer_slot) + "], rax");
+
+        std::vector<int> argument_offsets;
+        argument_offsets.reserve(resolved_arguments.size());
+        for (std::size_t i = 0; i < resolved_arguments.size(); ++i) {
+            auto supported = ensure_supported_type(info->parameter_types[i], resolved_arguments[i]->range);
+            if (!supported) {
+                release_temp_slot();
+                return std::unexpected(supported.error());
+            }
+
+            const int offset = acquire_temp_slot();
+            if (is_aggregate_runtime_type(info->parameter_types[i])) {
+                auto emitted = emit_aggregate_source_address(*resolved_arguments[i]);
+                if (!emitted) {
+                    release_temp_slot();
+                    release_temp_slot();
+                    return std::unexpected(emitted.error());
+                }
+            } else {
+                auto emitted = emit_expression(*resolved_arguments[i]);
+                if (!emitted) {
+                    release_temp_slot();
+                    release_temp_slot();
+                    return std::unexpected(emitted.error());
+                }
+                auto normalized = normalize_rax(info->parameter_types[i], resolved_arguments[i]->range);
+                if (!normalized) {
+                    release_temp_slot();
+                    release_temp_slot();
+                    return std::unexpected(normalized.error());
+                }
+            }
+            emit_body_line("mov qword ptr [rbp - " + std::to_string(offset) + "], rax");
+            argument_offsets.push_back(offset);
+        }
+
+        emit_body_line("mov rdi, qword ptr [rbp - " + std::to_string(result_pointer_slot) + "]");
+        for (std::size_t i = 0; i < argument_offsets.size(); ++i) {
+            emit_body_line("mov " + std::string(kArgumentRegisters[i + 1]) +
+                           ", qword ptr [rbp - " + std::to_string(argument_offsets[i]) + "]");
+        }
+        for (std::size_t i = 0; i < argument_offsets.size(); ++i) {
+            release_temp_slot();
+        }
+        emit_body_line("call " + mangle_name(resolved_name));
+        emit_body_line("mov rax, qword ptr [rbp - " + std::to_string(result_pointer_slot) + "]");
+        release_temp_slot();
+        return {};
+    }
+
+    std::expected<void, CodegenError> emit_builtin_print(const AST::CallExpr& call) {
+        const auto args_it = semantic_result_.resolved_call_arguments.find(&call);
+        if (args_it == semantic_result_.resolved_call_arguments.end() || args_it->second.size() != 1) {
+            return std::unexpected(make_error(call.range, "builtin 'print' expects 1 argument"));
+        }
+        const auto& argument = *args_it->second[0];
+
+        auto argument_type = expression_type(argument);
         if (!argument_type) {
             return std::unexpected(argument_type.error());
         }
         if (!is_scalar_runtime_type(*argument_type)) {
             return std::unexpected(make_error(
-                call.arguments[0]->range,
+                argument.range,
                 "codegen does not yet support printing type '" + argument_type->name + '\''));
         }
 
-        auto emitted = emit_expression(*call.arguments[0]);
+        auto emitted = emit_expression(argument);
         if (!emitted) {
             return std::unexpected(emitted.error());
         }
@@ -1572,7 +1854,7 @@ class Generator {
                                            : "print_i64"));
         } else {
             return std::unexpected(make_error(
-                call.arguments[0]->range,
+                argument.range,
                 "codegen does not yet support printing type '" + argument_type->name + '\''));
         }
 
@@ -1580,20 +1862,20 @@ class Generator {
         return {};
     }
 
-    //builtin len
-    //для массива длина известна сразу из типа, для строки зовём strlen
     std::expected<void, CodegenError> emit_builtin_len(const AST::CallExpr& call) {
-        if (call.arguments.size() != 1) {
+        const auto args_it = semantic_result_.resolved_call_arguments.find(&call);
+        if (args_it == semantic_result_.resolved_call_arguments.end() || args_it->second.size() != 1) {
             return std::unexpected(make_error(call.range, "builtin 'len' expects 1 argument"));
         }
+        const auto& argument = *args_it->second[0];
 
-        auto argument_type = expression_type(*call.arguments[0]);
+        auto argument_type = expression_type(argument);
         if (!argument_type) {
             return std::unexpected(argument_type.error());
         }
 
         if (argument_type->kind == Semantic::SemanticTypeKind::Array) {
-            auto evaluated = emit_aggregate_source_address(*call.arguments[0]);
+            auto evaluated = emit_aggregate_source_address(argument);
             if (!evaluated) {
                 return std::unexpected(evaluated.error());
             }
@@ -1605,7 +1887,7 @@ class Generator {
             return normalize_rax(*type, call.range);
         }
 
-        auto emitted = emit_expression(*call.arguments[0]);
+        auto emitted = emit_expression(argument);
         if (!emitted) {
             return std::unexpected(emitted.error());
         }
@@ -1619,14 +1901,14 @@ class Generator {
         return normalize_rax(*type, call.range);
     }
 
-    //builtin assert
-    //если условие ложно, падаем через runtime panic
     std::expected<void, CodegenError> emit_builtin_assert(const AST::CallExpr& call) {
-        if (call.arguments.size() != 1) {
+        const auto args_it = semantic_result_.resolved_call_arguments.find(&call);
+        if (args_it == semantic_result_.resolved_call_arguments.end() || args_it->second.size() != 1) {
             return std::unexpected(make_error(call.range, "builtin 'assert' expects 1 argument"));
         }
+        const auto& argument = *args_it->second[0];
 
-        auto emitted = emit_expression(*call.arguments[0]);
+        auto emitted = emit_expression(argument);
         if (!emitted) {
             return std::unexpected(emitted.error());
         }
@@ -1643,11 +1925,13 @@ class Generator {
     }
 
     std::expected<void, CodegenError> emit_builtin_exit(const AST::CallExpr& call) {
-        if (call.arguments.size() != 1) {
+        const auto args_it = semantic_result_.resolved_call_arguments.find(&call);
+        if (args_it == semantic_result_.resolved_call_arguments.end() || args_it->second.size() != 1) {
             return std::unexpected(make_error(call.range, "builtin 'exit' expects 1 argument"));
         }
+        const auto& argument = *args_it->second[0];
 
-        auto emitted = emit_expression(*call.arguments[0]);
+        auto emitted = emit_expression(argument);
         if (!emitted) {
             return std::unexpected(emitted.error());
         }
@@ -1658,11 +1942,13 @@ class Generator {
     }
 
     std::expected<void, CodegenError> emit_builtin_panic(const AST::CallExpr& call) {
-        if (call.arguments.size() != 1) {
+        const auto args_it = semantic_result_.resolved_call_arguments.find(&call);
+        if (args_it == semantic_result_.resolved_call_arguments.end() || args_it->second.size() != 1) {
             return std::unexpected(make_error(call.range, "builtin 'panic' expects 1 argument"));
         }
+        const auto& argument = *args_it->second[0];
 
-        auto emitted = emit_expression(*call.arguments[0]);
+        auto emitted = emit_expression(argument);
         if (!emitted) {
             return std::unexpected(emitted.error());
         }
@@ -1673,7 +1959,8 @@ class Generator {
     }
 
     std::expected<void, CodegenError> emit_builtin_input(const AST::CallExpr& call) {
-        if (!call.arguments.empty()) {
+        const auto args_it = semantic_result_.resolved_call_arguments.find(&call);
+        if (args_it != semantic_result_.resolved_call_arguments.end() && !args_it->second.empty()) {
             return std::unexpected(make_error(call.range, "builtin 'input' expects no arguments"));
         }
 
@@ -1681,8 +1968,6 @@ class Generator {
         return {};
     }
 
-    //записать выражение по адресу в rdi
-    //это основной helper для array/struct copy semantics
     std::expected<void, CodegenError> emit_store_expression_to_rdi(
         const AST::Expr& expression, const Semantic::SemanticType& target_type) {
         auto supported = ensure_supported_type(target_type, expression.range);
@@ -1734,7 +2019,6 @@ class Generator {
         return {};
     }
 
-    //запись литерала массива в заранее выделенную память
     std::expected<void, CodegenError> emit_array_literal_to_pointer(
         const AST::ArrayLiteralExpr& literal, const Semantic::SemanticType& target_type) {
         auto element_type = resolve_type_name(target_type.element_type_name, literal.range);
@@ -1768,7 +2052,6 @@ class Generator {
         return {};
     }
 
-    //запись литерала структуры в заранее выделенную память
     std::expected<void, CodegenError> emit_struct_literal_to_pointer(
         const AST::StructLiteralExpr& literal, const Semantic::SemanticType& target_type) {
         auto struct_info = lookup_struct_info(target_type.name, literal.range);
@@ -1817,8 +2100,6 @@ class Generator {
         return {};
     }
 
-    //получить адрес aggregate-значения
-    //это важно для массивов, структур и aggregate-return функций
     std::expected<void, CodegenError> emit_aggregate_source_address(const AST::Expr& expression) {
         auto type = expression_type(expression);
         if (!type) {
@@ -1833,6 +2114,34 @@ class Generator {
         if (is_scalar_runtime_type(*type) || type->name == "void") {
             return std::unexpected(make_error(
                 expression.range, "internal error: aggregate address requested for scalar value"));
+        }
+
+        if (const auto* unary = dynamic_cast<const AST::UnaryExpr*>(&expression)) {
+            const auto resolved = semantic_result_.resolved_unary_operator_calls.find(unary);
+            if (resolved != semantic_result_.resolved_unary_operator_calls.end()) {
+                const auto args_it = semantic_result_.resolved_unary_operator_arguments.find(unary);
+                if (args_it == semantic_result_.resolved_unary_operator_arguments.end()) {
+                    return std::unexpected(make_error(
+                        expression.range,
+                        "internal error: missing aggregate unary operator arguments"));
+                }
+                return emit_aggregate_resolved_function_call(resolved->second, args_it->second, *type,
+                                                            expression.range);
+            }
+        }
+
+        if (const auto* binary = dynamic_cast<const AST::BinaryExpr*>(&expression)) {
+            const auto resolved = semantic_result_.resolved_binary_operator_calls.find(binary);
+            if (resolved != semantic_result_.resolved_binary_operator_calls.end()) {
+                const auto args_it = semantic_result_.resolved_binary_operator_arguments.find(binary);
+                if (args_it == semantic_result_.resolved_binary_operator_arguments.end()) {
+                    return std::unexpected(make_error(
+                        expression.range,
+                        "internal error: missing aggregate binary operator arguments"));
+                }
+                return emit_aggregate_resolved_function_call(resolved->second, args_it->second, *type,
+                                                            expression.range);
+            }
         }
 
         if (dynamic_cast<const AST::IdentifierExpr*>(&expression) != nullptr ||
@@ -1868,73 +2177,13 @@ class Generator {
                     call->range,
                     "internal error: scalar-return function used in aggregate context"));
             }
-
-            const std::size_t required_registers = info->parameter_types.size() + 1;
-            if (required_registers > 6) {
+            const auto args_it = semantic_result_.resolved_call_arguments.find(call);
+            if (args_it == semantic_result_.resolved_call_arguments.end()) {
                 return std::unexpected(make_error(
-                    call->range,
-                    "codegen currently supports at most 6 register arguments per call"));
+                    expression.range, "internal error: missing resolved aggregate call arguments"));
             }
-
-            auto size = type_size(*type, expression.range);
-            if (!size) {
-                return std::unexpected(size.error());
-            }
-
-            const int result_offset = allocate_stack_bytes(*size);
-            const int result_pointer_slot = acquire_temp_slot();
-            emit_body_line("lea rax, [rbp - " + std::to_string(result_offset) + "]");
-            emit_body_line("mov qword ptr [rbp - " + std::to_string(result_pointer_slot) + "], rax");
-
-            std::vector<int> argument_offsets;
-            argument_offsets.reserve(call->arguments.size());
-            for (std::size_t i = 0; i < call->arguments.size(); ++i) {
-                auto supported =
-                    ensure_supported_type(info->parameter_types[i], call->arguments[i]->range);
-                if (!supported) {
-                    release_temp_slot();
-                    return std::unexpected(supported.error());
-                }
-
-                const int offset = acquire_temp_slot();
-                if (is_aggregate_runtime_type(info->parameter_types[i])) {
-                    auto emitted = emit_aggregate_source_address(*call->arguments[i]);
-                    if (!emitted) {
-                        release_temp_slot();
-                        release_temp_slot();
-                        return std::unexpected(emitted.error());
-                    }
-                } else {
-                    auto emitted = emit_expression(*call->arguments[i]);
-                    if (!emitted) {
-                        release_temp_slot();
-                        release_temp_slot();
-                        return std::unexpected(emitted.error());
-                    }
-                    auto normalized =
-                        normalize_rax(info->parameter_types[i], call->arguments[i]->range);
-                    if (!normalized) {
-                        release_temp_slot();
-                        release_temp_slot();
-                        return std::unexpected(normalized.error());
-                    }
-                }
-                emit_body_line("mov qword ptr [rbp - " + std::to_string(offset) + "], rax");
-                argument_offsets.push_back(offset);
-            }
-
-            emit_body_line("mov rdi, qword ptr [rbp - " + std::to_string(result_pointer_slot) + "]");
-            for (std::size_t i = 0; i < argument_offsets.size(); ++i) {
-                emit_body_line("mov " + std::string(kArgumentRegisters[i + 1]) +
-                               ", qword ptr [rbp - " + std::to_string(argument_offsets[i]) + "]");
-            }
-            for (std::size_t i = 0; i < argument_offsets.size(); ++i) {
-                release_temp_slot();
-            }
-            emit_body_line("call " + mangle_name(resolved->second));
-            emit_body_line("mov rax, qword ptr [rbp - " + std::to_string(result_pointer_slot) + "]");
-            release_temp_slot();
-            return {};
+            return emit_aggregate_resolved_function_call(resolved->second, args_it->second, *type,
+                                                        expression.range);
         }
 
         if (const auto* assignment = dynamic_cast<const AST::AssignmentExpr*>(&expression)) {
@@ -1985,8 +2234,6 @@ class Generator {
             expression.range, "codegen does not yet support this aggregate expression"));
     }
 
-    //получить адрес lvalue:
-    //локальной переменной, элемента массива или поля структуры
     std::expected<void, CodegenError> emit_lvalue_address(const AST::Expr& expression) {
         if (const auto* identifier = dynamic_cast<const AST::IdentifierExpr*>(&expression)) {
             auto storage = lookup_storage(identifier->name, expression.range);
@@ -2120,7 +2367,6 @@ class Generator {
         return it->second.type;
     }
 
-    //проверяет, умеет ли backend вообще работать с этим типом
     std::expected<void, CodegenError> ensure_supported_type(
         const Semantic::SemanticType& type, const Lexer::SourceRange& range) const {
         switch (type.kind) {
@@ -2162,7 +2408,6 @@ class Generator {
         return std::unexpected(make_error(range, "internal error: unsupported semantic type kind"));
     }
 
-    //scalar runtime type = то, что можно носить как одно значение в регистрах / слотах по 8 байт
     [[nodiscard]] bool is_scalar_runtime_type(const Semantic::SemanticType& type) const {
         return type.kind == Semantic::SemanticTypeKind::Builtin &&
                (type.name == "bool" || type.name == "char" || type.name == "string" ||
@@ -2170,7 +2415,6 @@ class Generator {
                 is_float_name(type.name));
     }
 
-    //aggregate runtime type = массив или структура
     [[nodiscard]] bool is_aggregate_runtime_type(const Semantic::SemanticType& type) const {
         return type.kind == Semantic::SemanticTypeKind::Array ||
                type.kind == Semantic::SemanticTypeKind::Struct;
@@ -2238,7 +2482,6 @@ class Generator {
         return it->second;
     }
 
-    //вычисляет размер типа в байтах
     std::expected<int, CodegenError> type_size(const Semantic::SemanticType& type,
                                                const Lexer::SourceRange& range) const {
         switch (type.kind) {
@@ -2314,8 +2557,9 @@ class Generator {
                        '\''));
     }
 
-    //после вычисления значения в rax приводим его к правильной ширине
-    //например int8 -> sign extend, uint8 -> zero extend
+    
+   // обрезает/расширяет значение в rax до нужной разрядности типа
+
     std::expected<void, CodegenError> normalize_rax(const Semantic::SemanticType& type,
                                                     const Lexer::SourceRange& range) {
         if (type.name == "void" || type.name == "string" || type.name == "bool" ||
@@ -2350,6 +2594,9 @@ class Generator {
         return {};
     }
 
+    // Выбирает инструкцию условной установки флага для сравнений
+    // Для unsigned типов используем беззнаковые инструкции (b/a вместо l/g)
+
     [[nodiscard]] std::string setcc_instruction(Lexer::TokenType op_type,
                                                 std::string_view operand_type) const {
         const bool is_unsigned = is_unsigned_integer_name(operand_type);
@@ -2368,24 +2615,24 @@ class Generator {
         }
     }
 
-    //генерация уникального label
+  
     [[nodiscard]] std::string new_label(std::string prefix) {
         return prefix + "_" + std::to_string(label_counter_++);
     }
 
-    //выделяет один 8-байтовый слот на стеке
+
     [[nodiscard]] int allocate_stack_slot() {
         current_function_->next_stack_offset += 8;
         return current_function_->next_stack_offset;
     }
 
-    //выделяет произвольный блок памяти на стеке с выравниванием
+    // Выделяет произвольное количество байт (выровненное по 8) для массивов и структур
     [[nodiscard]] int allocate_stack_bytes(int size) {
         current_function_->next_stack_offset += align_to(size, 8);
         return current_function_->next_stack_offset;
     }
 
-    //выдаёт временный слот для промежуточных вычислений
+   
     [[nodiscard]] int acquire_temp_slot() {
         if (current_function_->temp_depth == static_cast<int>(current_function_->temp_slots.size())) {
             current_function_->temp_slots.push_back(allocate_stack_slot());
@@ -2395,19 +2642,17 @@ class Generator {
         return offset;
     }
 
+    // Освобождает последний временный слот (уменьшает depth)
+    // Слот не уничтожается его можно переиспользовать
     void release_temp_slot() { --current_function_->temp_depth; }
 
-    //добавляет одну инструкцию в тело текущей функции
     void emit_body_line(const std::string& line) { current_function_->body << "    " << line << '\n'; }
 
-    //добавляет label без отступа
     void emit_body_label(const std::string& label) { current_function_->body << label << ":\n"; }
-
-    //кладёт строку в .rodata и возвращает label на неё
     std::string intern_string(const std::string& value) {
         const auto found = string_labels_.find(value);
         if (found != string_labels_.end()) {
-            return found->second;
+            return found->second;  
         }
 
         const auto label = ".Lstr_" + std::to_string(string_counter_++);
@@ -2418,7 +2663,6 @@ class Generator {
     }
 };
 
-//внешняя точка входа: создаём Generator и просим его вернуть готовый asm
 std::expected<std::string, CodegenError> generate_program(
     const AST::Program& program, const Semantic::SemanticResult& semantic_result,
     std::string filename) {

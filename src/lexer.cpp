@@ -4,13 +4,15 @@
 
 namespace {
 
-// Эти helpers не зависят от состояния Lexer и просто отвечают на вопросы
-// про отдельные символы.
+//эти helpers не зависят от состояния lexer и просто отвечают на вопросы про отдельные символы
+
+//может ли этот символ быть первым символом имени
 bool is_identifier_start(char ch) {
     const auto byte = static_cast<unsigned char>(ch);
     return std::isalpha(byte) != 0 || ch == '_';
 }
 
+//может ли символ стоять внутри имени(не первым)
 bool is_identifier_part(char ch) {
     const auto byte = static_cast<unsigned char>(ch);
     return std::isalnum(byte) != 0 || ch == '_';
@@ -20,6 +22,7 @@ bool is_digit(char ch) {
     return std::isdigit(static_cast<unsigned char>(ch)) != 0;
 }
 
+//16-тиричной
 bool is_hex_digit(char ch) {
     return std::isxdigit(static_cast<unsigned char>(ch)) != 0;
 }
@@ -31,8 +34,8 @@ bool is_binary_digit(char ch) {
 Lexer::TokenType identifier_token_type(std::string_view lexeme) {
     using TokenType = Lexer::TokenType;
 
-    // Идентификаторы и ключевые слова читаются одинаково, поэтому сначала
-    // считываем всё слово целиком, а потом определяем его класс.
+    // идентификаторы и ключевые слова читаются одинаково, сначала
+    //считываем всё слово целиком, а потом определяем его класс
     if (lexeme == "let") {
         return TokenType::Let;
     }
@@ -56,6 +59,9 @@ Lexer::TokenType identifier_token_type(std::string_view lexeme) {
     }
     if (lexeme == "import") {
         return TokenType::Import;
+    }
+    if (lexeme == "export") {
+    return TokenType::Export;
     }
     if (lexeme == "if") {
         return TokenType::If;
@@ -139,10 +145,10 @@ Lexer::TokenType identifier_token_type(std::string_view lexeme) {
         return TokenType::FloatLiteral;
     }
 
-    return TokenType::Identifier;
+    return TokenType::Identifier; //обычное имя 
 }
 
-}  // namespace
+} 
 
 namespace Lexer {
 
@@ -159,8 +165,6 @@ std::expected<Token, LexError> Lexer::next_token() {
         return make_eof_token();
     }
 
-    // После пропуска пробелов и комментариев достаточно первого символа,
-    // чтобы выбрать нужную ветку лексического анализа.
     if (is_identifier_start(peek())) {
         return lex_identifier_or_keyword();
     }
@@ -179,7 +183,7 @@ std::expected<Token, LexError> Lexer::next_token() {
 
     const SourceLocation start = location_;
     const char ch = advance();
-
+//разбор операторов, скобок и разделителей
     switch (ch) {
         case '+':
             return make_token(TokenType::Plus, start);
@@ -260,7 +264,7 @@ std::expected<Token, LexError> Lexer::next_token() {
                 return make_token(TokenType::ColonColon, start);
             }
             return make_token(TokenType::Colon, start);
-        default:
+        default: //ошибка на неизвестный символ
             return std::unexpected(make_error(std::string("unexpected character '") + ch + "'", start));
     }
 }
@@ -269,7 +273,7 @@ std::expected<std::vector<Token>, LexError> Lexer::tokenize() {
     std::vector<Token> tokens;
 
     // next_token() возвращает токены по одному, а tokenize() просто
-    // собирает их в вектор до EndOfFile.
+    // собирает их в вектор до EndOfFile
     while (true) {
         auto token_or_error = next_token();
         if (!token_or_error) {
@@ -289,6 +293,7 @@ bool Lexer::is_at_end() const {
     return index_ >= source_.size();
 }
 
+//возвращает текущий символ без продвижения позиции
 char Lexer::peek() const {
     if (is_at_end()) {
         return '\0';
@@ -296,6 +301,7 @@ char Lexer::peek() const {
     return source_[index_];
 }
 
+//возвращает символ на одну позицию вперёд без продвижения (для двухсимвольных операторов)
 char Lexer::peek_next() const {
     if (index_ + 1 >= source_.size()) {
         return '\0';
@@ -307,8 +313,8 @@ char Lexer::advance() {
     const char ch = source_[index_++];
     ++location_.offset;
 
-    // Позиция обновляется на каждом символе, чтобы ошибки потом можно было
-    // привязать к точному месту в исходнике.
+    //позиция обновляется на каждом символе, чтобы ошибки потом можно было
+// привязать к точному месту в исходнике
     if (ch == '\n') {
         ++location_.line;
         location_.column = 1;
@@ -319,6 +325,7 @@ char Lexer::advance() {
     return ch;
 }
 
+//проверка если текущий символ равен ожидаемому
 bool Lexer::match(char expected) {
     if (is_at_end() || source_[index_] != expected) {
         return false;
@@ -332,13 +339,13 @@ std::expected<void, LexError> Lexer::skip_whitespace_and_comments() {
     while (!is_at_end()) {
         const char ch = peek();
 
+        //пропуск пробельных символов
         if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
             advance();
             continue;
         }
 
-        // В языке поддерживаются только однострочные комментарии //.
-        // Всё до конца строки просто пропускается.
+        // поддерживаются однострочные комментарии // и /* блочные */
         if (ch == '/' && peek_next() == '/') {
             advance();
             advance();
@@ -391,7 +398,7 @@ std::expected<void, LexError> Lexer::skip_whitespace_and_comments() {
 std::expected<Token, LexError> Lexer::lex_identifier_or_keyword() {
     const SourceLocation start = location_;
 
-    // Считываем максимально длинную последовательность символов идентификатора.
+    // cчитываем максимально длинную последовательность символов идентификатора
     while (is_identifier_part(peek())) {
         advance();
     }
@@ -400,9 +407,11 @@ std::expected<Token, LexError> Lexer::lex_identifier_or_keyword() {
     return make_token(identifier_token_type(lexeme), start);
 }
 
+//читает числовой литерал
 std::expected<Token, LexError> Lexer::lex_number() {
     const SourceLocation start = location_;
 
+    //16-тиричный
     if (peek() == '0' && (peek_next() == 'x' || peek_next() == 'X')) {
         advance();
         advance();
@@ -415,6 +424,7 @@ std::expected<Token, LexError> Lexer::lex_number() {
         return make_token(TokenType::IntLiteral, start);
     }
 
+    //двоичный
     if (peek() == '0' && (peek_next() == 'b' || peek_next() == 'B')) {
         advance();
         advance();
@@ -427,15 +437,13 @@ std::expected<Token, LexError> Lexer::lex_number() {
         return make_token(TokenType::IntLiteral, start);
     }
 
-    // Сначала читается целая часть числа.
+    //  целая часть числа
     while (is_digit(peek())) {
         advance();
     }
-
     TokenType type = TokenType::IntLiteral;
 
-    // Число считается вещественным только если после точки есть хотя бы
-    // одна цифра. Из-за этого "1." не принимается как float literal.
+    //float
     if (peek() == '.' && is_digit(peek_next())) {
         type = TokenType::FloatLiteral;
         advance();
@@ -445,6 +453,7 @@ std::expected<Token, LexError> Lexer::lex_number() {
         }
     }
 
+    //экспонента
     if (peek() == 'e' || peek() == 'E') {
         const auto exponent_mark = index_;
         const auto exponent_location = location_;
@@ -467,9 +476,10 @@ std::expected<Token, LexError> Lexer::lex_number() {
     return make_token(type, start);
 }
 
+//разбирает строковый литерал (текст в двойных кавычках)
 std::expected<Token, LexError> Lexer::lex_string() {
     const SourceLocation start = location_;
-    // Пропускаем открывающую кавычку и начинаем читать содержимое строки.
+    // пропускаем открывающую кавычку и начинаем читать содержимое строки
     advance();
 
     while (!is_at_end()) {
@@ -480,10 +490,12 @@ std::expected<Token, LexError> Lexer::lex_string() {
             return make_token(TokenType::StringLiteral, start);
         }
 
+        //строка должна быть на одной строке иначе ошибка
         if (ch == '\n') {
             return std::unexpected(make_error("unterminated string literal", location_));
         }
 
+        //начинается escape-последовательность
         if (ch == '\\') {
             const SourceLocation escape_location = location_;
             advance();
@@ -491,10 +503,7 @@ std::expected<Token, LexError> Lexer::lex_string() {
             if (is_at_end()) {
                 return std::unexpected(make_error("unterminated string literal", location_));
             }
-
-            // Escape-последовательности проверяются уже на этапе лексера,
-            // чтобы дальше parser и semantic работали только с валидными
-            // строковыми литералами.
+//поддерживаются \" , \\, \n, \t
             const char escaped = advance();
             if (escaped != '"' && escaped != '\\' && escaped != 'n' && escaped != 't') {
                 return std::unexpected(make_error("invalid escape sequence", escape_location));
@@ -542,16 +551,15 @@ std::expected<Token, LexError> Lexer::lex_char() {
 }
 
 Token Lexer::make_token(TokenType type, SourceLocation start) const {
-    // lexeme вырезается прямо из исходного текста по диапазону [start, current).
+    //собирает обычный токен из уже прочитанного фрагмента текста
     return Token {
         .type = type,
         .lexeme = std::string(source_.substr(start.offset, location_.offset - start.offset)),
         .range = SourceRange {start, location_},
     };
 }
-
+//создаёт специальный токен конца файла
 Token Lexer::make_eof_token() const {
-    // EOF не занимает символов, поэтому begin и end совпадают.
     return Token {
         .type = TokenType::EndOfFile,
         .lexeme = "",
@@ -560,7 +568,7 @@ Token Lexer::make_eof_token() const {
 }
 
 LexError Lexer::make_error(std::string message, SourceLocation location) const {
-    // Здесь собираем структуру ошибки, а в main.cpp она уже форматируется для вывода.
+    // здесь собираем структуру ошибки, а в main.cpp она уже форматируется для вывода
     return LexError {
         .filename = filename_,
         .message = std::move(message),
@@ -573,4 +581,4 @@ std::expected<std::vector<Token>, LexError> tokenize(std::string_view source, st
     return lexer.tokenize();
 }
 
-}  // namespace Lexer
+}  

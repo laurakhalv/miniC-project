@@ -17,8 +17,7 @@ struct CodegenError {
 std::string format_error(const CodegenError& error);
 
 std::expected<std::string, CodegenError> generate_program(
-    const AST::Program& program,
-    const Semantic::SemanticResult& semantic_result,
+    const AST::Program& program, const Semantic::SemanticResult& semantic_result,
     std::string filename = "<memory>");
 
-}  
+} 

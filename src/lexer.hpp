@@ -9,19 +9,17 @@
 
 namespace Lexer {
 
-// Lexer читает исходный текст посимвольно и превращает его в поток Token.
+// lexer читает исходный текст посимвольно и превращает его в поток token
 class Lexer {
   public:
     explicit Lexer(std::string_view source, std::string filename = "<memory>");
 
-    // Возвращает один следующий токен или лексическую ошибку.
+    // возвращает один следующий токен или лексическую ошибку
     std::expected<Token, LexError> next_token();
-    // Удобный helper: лексит весь файл целиком до EndOfFile.
+    // helper лексит весь файл целиком до EndOfFile
     std::expected<std::vector<Token>, LexError> tokenize();
 
   private:
-    // source_ - весь текст программы, index_ - текущая позиция в строке.
-    // location_ дублирует позицию в более удобном для diagnostics виде.
     std::string_view source_;
     std::string filename_;
     std::size_t index_ = 0;
@@ -33,10 +31,10 @@ class Lexer {
     char advance();
     bool match(char expected);
 
-    // Пропускает пробелы и комментарии, чтобы next_token() работал уже
-    // только с содержательными символами языка.
+    // пропускает пробелы и комментарии
     std::expected<void, LexError> skip_whitespace_and_comments();
 
+    //лексирование конкретных токенов
     std::expected<Token, LexError> lex_identifier_or_keyword();
     std::expected<Token, LexError> lex_number();
     std::expected<Token, LexError> lex_char();

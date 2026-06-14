@@ -1,7 +1,5 @@
 #pragma once
-
 #include "token.hpp"
-
 #include <cstddef>
 #include <iosfwd>
 #include <memory>
@@ -17,10 +15,9 @@ using TokenType = Lexer::TokenType;
 struct Node {
     explicit Node(SourceRange source_range);
     virtual ~Node() = default;
-
     SourceRange range;
 
-    // dump() используется для --dump-ast и печатает дерево в читаемом виде.
+    // dump() используется для --dump-ast и печатает дерево в читаемом виде
     virtual void dump(std::ostream& out, int indent) const = 0;
 };
 
@@ -33,23 +30,27 @@ enum class Visibility {
     Public,
     Private,
 };
-
+//объявление
 struct Decl : Node {
     using Node::Node;
+    // ( Доп 3) объявление может быть экспортируемым
+    // или приватным относительно других модулей.
+    bool is_exported = false;
+    bool has_module_visibility = false;
 };
 
-// Stmt - любой узел, который может стоять внутри блока как отдельная инструкция.
+// инструкция
 struct Stmt : Node {
     using Node::Node;
 };
 
-// Expr - узел, который вычисляется в значение и может быть частью другого выражения.
+// выражения
 struct Expr : Node {
     using Node::Node;
 };
 
-// TypeSyntax хранит имя типа в том виде, как оно записано в программе.
-// Например: int32, Point, Math::Point, int32[3].
+// хранит имя типа в том виде, как оно записано в программе
+//  int32, Point, Math::Point, int32[3]
 struct TypeSyntax final : Node {
     std::vector<std::string> name_parts;
     std::optional<std::string> array_size;
@@ -60,6 +61,7 @@ struct TypeSyntax final : Node {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//один параметр функции
 struct Parameter {
     std::unique_ptr<TypeSyntax> type;
     std::string name;
@@ -69,6 +71,7 @@ struct Parameter {
     void dump(std::ostream& out, int indent) const;
 };
 
+//oдно поле структуры
 struct FieldDecl {
     std::unique_ptr<TypeSyntax> type;
     std::string name;
@@ -78,6 +81,7 @@ struct FieldDecl {
     void dump(std::ostream& out, int indent) const;
 };
 
+//инициализация одного поля при создании структуры
 struct FieldInitializer {
     std::string name;
     std::unique_ptr<Expr> value;
@@ -86,17 +90,26 @@ struct FieldInitializer {
     void dump(std::ostream& out, int indent) const;
 };
 
+struct ImportSpec {
+    std::vector<std::string> module_path;
+    std::optional<std::vector<std::string>> imported_path;
+    SourceRange range {};
+
+    void dump(std::ostream& out, int indent) const;
+};
+
+//корень всего дерева 
 struct Program {
-    // declarations - корневой список top-level объявлений модуля.
+    // declarations список всех объявлений верхнего уровня
     std::optional<std::vector<std::string>> module_name;
-    std::vector<std::vector<std::string>> imports;
+    std::vector<ImportSpec> imports;
     std::vector<std::unique_ptr<Decl>> declarations;
 
     void dump(std::ostream& out) const;
 };
 
-// BlockStmt вводит локальную область видимости и содержит последовательность
-// инструкций внутри фигурных скобок.
+//вводит локальную область видимости и содержит последовательность
+// инструкций внутри фигурных скобок
 struct BlockStmt final : Stmt {
     std::vector<std::unique_ptr<Stmt>> statements;
 
@@ -105,6 +118,7 @@ struct BlockStmt final : Stmt {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//обьявление функции
 struct FunctionDecl final : Decl {
     std::string name;
     std::vector<Parameter> parameters;
@@ -123,6 +137,7 @@ struct FunctionDecl final : Decl {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//обьявление структуры 
 struct StructDecl final : Decl {
     std::string name;
     std::vector<FieldDecl> fields;
@@ -134,6 +149,7 @@ struct StructDecl final : Decl {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//тип alias (синоним типа) 
 struct TypeAliasDecl final : Decl {
     std::string name;
     std::unique_ptr<TypeSyntax> aliased_type;
@@ -143,7 +159,7 @@ struct TypeAliasDecl final : Decl {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//пространство имён; namespace Math { func square(...) {} }
 struct NamespaceDecl final : Decl {
     std::string name;
     std::vector<std::unique_ptr<Decl>> declarations;
@@ -153,7 +169,7 @@ struct NamespaceDecl final : Decl {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//oбъявление переменной
 struct VariableDeclStmt final : Stmt {
     Mutability mutability;
     std::unique_ptr<TypeSyntax> type;
@@ -167,6 +183,7 @@ struct VariableDeclStmt final : Stmt {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//yсловная инструкция: if (x > 0) { ... } else { ... }
 struct IfStmt final : Stmt {
     std::unique_ptr<Expr> condition;
     std::unique_ptr<BlockStmt> then_branch;
@@ -179,6 +196,7 @@ struct IfStmt final : Stmt {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//цикл: while (x > 0) { ... }
 struct WhileStmt final : Stmt {
     std::unique_ptr<Expr> condition;
     std::unique_ptr<BlockStmt> body;
@@ -189,6 +207,7 @@ struct WhileStmt final : Stmt {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//возврат из функции
 struct ReturnStmt final : Stmt {
     std::unique_ptr<Expr> value;
 
@@ -196,19 +215,20 @@ struct ReturnStmt final : Stmt {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//break
 struct BreakStmt final : Stmt {
     explicit BreakStmt(SourceRange range);
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//continue
 struct ContinueStmt final : Stmt {
     explicit ContinueStmt(SourceRange range);
 
     void dump(std::ostream& out, int indent) const override;
 };
 
+//x=5;
 struct ExprStmt final : Stmt {
     std::unique_ptr<Expr> expression;
 
@@ -216,15 +236,16 @@ struct ExprStmt final : Stmt {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//; (пустая инструкция)
 struct EmptyStmt final : Stmt {
     explicit EmptyStmt(SourceRange range);
 
     void dump(std::ostream& out, int indent) const override;
 };
 
+//присваивание
 struct AssignmentExpr final : Expr {
-    // target - что присваиваем, value - что записываем.
+    // target -что присваиваем, value -что записываем
     std::unique_ptr<Expr> target;
     std::unique_ptr<Expr> value;
 
@@ -234,8 +255,9 @@ struct AssignmentExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//бинарная операция
 struct BinaryExpr final : Expr {
-    // В BinaryExpr сохраняем и вид оператора, и его текстовую форму.
+    // в BinaryExpr сохраняем и вид оператора, и его текстовую форму
     TokenType op_type;
     std::string op_lexeme;
     std::unique_ptr<Expr> left;
@@ -247,6 +269,7 @@ struct BinaryExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//унарная
 struct UnaryExpr final : Expr {
     TokenType op_type;
     std::string op_lexeme;
@@ -258,6 +281,7 @@ struct UnaryExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//явное привидение типа
 struct CastExpr final : Expr {
     std::unique_ptr<TypeSyntax> target_type;
     std::unique_ptr<Expr> expression;
@@ -267,7 +291,7 @@ struct CastExpr final : Expr {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//один аргумент вызова функции (доп A.2.10)
 struct CallArgument {
     std::optional<std::string> name;
     std::unique_ptr<Expr> value;
@@ -276,6 +300,7 @@ struct CallArgument {
     void dump(std::ostream& out, int indent) const;
 };
 
+//вызов функции
 struct CallExpr final : Expr {
     std::unique_ptr<Expr> callee;
     std::vector<CallArgument> arguments;
@@ -285,7 +310,7 @@ struct CallExpr final : Expr {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//индексирование массива
 struct IndexExpr final : Expr {
     std::unique_ptr<Expr> base;
     std::unique_ptr<Expr> index;
@@ -296,6 +321,7 @@ struct IndexExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//доступ к полю структуры: p.x, obj.name
 struct FieldAccessExpr final : Expr {
     std::unique_ptr<Expr> base;
     std::string field;
@@ -305,16 +331,15 @@ struct FieldAccessExpr final : Expr {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//oбращение к переменной
 struct IdentifierExpr final : Expr {
-    // Имя пока хранится как строка; смысл имени позже определяет semantic analysis.
+    // имя пока хранится как строка (смысл имени позже определяет семантика)
     std::string name;
-
     IdentifierExpr(SourceRange range, std::string identifier_name);
-
     void dump(std::ostream& out, int indent) const override;
 };
 
+//обращение через ::: Math::pi
 struct NamespaceAccessExpr final : Expr {
     std::vector<std::string> path;
 
@@ -322,7 +347,7 @@ struct NamespaceAccessExpr final : Expr {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+  //литеральные выражение всехранят значение как строку
 struct IntLiteralExpr final : Expr {
     std::string value;
 
@@ -363,6 +388,7 @@ struct BoolLiteralExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+// (доп A.2.1) if-выражение 
 struct IfExpr final : Expr {
     std::unique_ptr<Expr> condition;
     std::unique_ptr<Expr> then_branch;
@@ -375,8 +401,9 @@ struct IfExpr final : Expr {
     void dump(std::ostream& out, int indent) const override;
 };
 
+//создание структуры: Point { x: 1, y: 2 } или Math::Point { x: 3, y: 4 }
 struct StructLiteralExpr final : Expr {
-    // type_path хранит путь к типу буквально так, как он был записан в программе.
+    // type_path хранит путь к типу буквально так, как он был записан в программе
     std::vector<std::string> type_path;
     std::vector<FieldInitializer> fields;
 
@@ -385,7 +412,7 @@ struct StructLiteralExpr final : Expr {
 
     void dump(std::ostream& out, int indent) const override;
 };
-
+//литерал массива
 struct ArrayLiteralExpr final : Expr {
     std::vector<std::unique_ptr<Expr>> elements;
 

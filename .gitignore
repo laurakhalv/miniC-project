@@ -1,5 +1,6 @@
 build/
 cmake-build-*/
+
 *.o
 *.obj
 *.a
@@ -8,7 +9,10 @@ cmake-build-*/
 *.dylib
 *.dll
 *.exe
+
 *.s
 *.out
+!runtime/minic_runtime.s
+
 .DS_Store
 .vscode/

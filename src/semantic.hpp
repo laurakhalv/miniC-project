@@ -10,6 +10,7 @@
 
 namespace Semantic {
 
+    //Структура ошибки семантики
 struct SemanticError {
     std::string filename {};
     std::string message {};
@@ -24,6 +25,7 @@ enum class SemanticTypeKind {
     Struct,
 };
 
+//тип в публичном виде передаётся кодогену через SemanticResult
 struct SemanticType {
     SemanticTypeKind kind = SemanticTypeKind::Builtin;
     std::string name {};
@@ -31,21 +33,34 @@ struct SemanticType {
     std::size_t array_size = 0;
 };
 
+//Информация о функциях, полях/методах структур, переменных. Всё в публичном виде для кодогена
 struct FunctionInfo {
     std::string full_name {};
     std::vector<SemanticType> parameter_types;
     SemanticType return_type {};
     bool is_builtin = false;
+    bool is_method = false;
+    std::string owner_struct_name {};
 };
 
 struct StructFieldInfo {
     std::string name {};
     SemanticType type {};
+    bool is_private = false;
+};
+
+struct StructMethodInfo {
+    std::string name {};
+    std::string full_name {};
+    std::vector<SemanticType> parameter_types;
+    SemanticType return_type {};
+    bool is_private = false;
 };
 
 struct StructInfo {
     std::string full_name {};
     std::vector<StructFieldInfo> fields;
+    std::vector<StructMethodInfo> methods;
 };
 
 struct VariableInfo {
@@ -53,11 +68,20 @@ struct VariableInfo {
     bool is_mutable = false;
 };
 
+//Главный результат всей семантики — набор таблиц с аннотациями
 struct SemanticResult {
     const AST::Program* program = nullptr;
 
     std::unordered_map<const AST::Expr*, SemanticType> expr_types;
     std::unordered_map<const AST::Expr*, std::string> resolved_functions;
+    std::unordered_map<const AST::CallExpr*, std::string> resolved_calls;
+    std::unordered_map<const AST::CallExpr*, std::vector<const AST::Expr*>> resolved_call_arguments;
+    std::unordered_map<const AST::UnaryExpr*, std::string> resolved_unary_operator_calls;
+    std::unordered_map<const AST::UnaryExpr*, std::vector<const AST::Expr*>>
+        resolved_unary_operator_arguments;
+    std::unordered_map<const AST::BinaryExpr*, std::string> resolved_binary_operator_calls;
+    std::unordered_map<const AST::BinaryExpr*, std::vector<const AST::Expr*>>
+        resolved_binary_operator_arguments;
     std::unordered_map<const AST::FunctionDecl*, FunctionInfo> functions;
     std::unordered_map<const AST::StructDecl*, StructInfo> structs;
     std::unordered_map<const AST::TypeAliasDecl*, SemanticType> aliases;
